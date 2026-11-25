@@ -1,15 +1,27 @@
-//! Where the cycles a deploy spends come from: what `icp_funding_options`
-//! reports.
+//! Where the cycles a deploy spends come from: what `icp_deploy` says of
+//! funding, in its description and in the answer of a deploy that ran short.
 //!
 //! `icp_deploy` creates canisters from the cycles-ledger balance of the
 //! principal it signs as ([`super::CLI_ORIGIN`]). When that balance is short
 //! the user has to buy cycles, and this server neither sells them nor takes a
 //! payment: its financial-operations policy (see [`crate::compliance`]) keeps
-//! every payment in an interface the user controls. What it can say is how
-//! much is there, to whom bought cycles must be delivered, and where they are
-//! sold.
+//! every payment in an interface the user controls. What it can say is to
+//! whom bought cycles must be delivered, how many are missing, and where they
+//! are sold.
 //!
-//! It says so without knowing any one payment provider:
+//! It says so in the deploy tool itself, with no tool of its own:
+//!
+//!   * **The tool's description names the providers** ([`advertised`]), so
+//!     an agent can tell the user where cycles are sold before it deploys.
+//!   * **A deploy the balance did not cover answers with [`Funding`]**: the
+//!     principal to credit, what the canisters still to create need, the
+//!     providers, and the steps. It is attached when the cycles ledger
+//!     itself refused a creation ([`ran_short`]) and never on a guess made
+//!     beforehand: a canister on a cloud engine is not paid for from the
+//!     ledger at all, so a balance checked ahead of the deploy would refuse
+//!     deploys that were going to succeed.
+//!
+//! And without knowing any one payment provider:
 //!
 //!   * **A provider is an app, named by its URL** ([`FundingProvider`]). The
 //!     list ([`FUNDING_PROVIDERS`]) holds nothing of how a provider takes an
@@ -24,7 +36,7 @@
 //!   * **Every provider's flow ends the same way** ([`STEPS`]): an order call
 //!     that moves nothing and answers one payment URL, which the user opens
 //!     to confirm a single payment on the provider's own page; the cycles
-//!     are delivered to the account of [`FundingOptions::principal`], and
+//!     are delivered to the account of [`Funding::principal`], and the next
 //!     `icp_deploy` creates canisters from it.
 //!
 //! So another provider is another entry in the list, and one that takes its
@@ -39,10 +51,15 @@
 //! only records what the user is about to pay for, on a page of the
 //! provider's, is neither.
 
-use rmcp::schemars;
-use serde::{Deserialize, Serialize};
+use std::{sync::Arc, time::Duration};
 
-use super::DEFAULT_CYCLES;
+use candid::Principal;
+use ic_agent::identity::AnonymousIdentity;
+use rmcp::schemars;
+use serde::Serialize;
+
+use super::{run::mainnet_agent, DeployOutcome, Status};
+use crate::cycles_balance_of;
 
 /// A service that sells cycles to the user: an Internet Computer app whose
 /// canisters an agent can find and read from its URL alone.
@@ -58,7 +75,7 @@ pub struct FundingProvider {
     pub pays_with: &'static str,
 }
 
-/// The providers `icp_funding_options` lists, in the order it lists them.
+/// The providers `icp_deploy` names, in the order it names them.
 ///
 /// What an entry takes, since listing one tells users of this server where
 /// to spend money:
@@ -89,12 +106,14 @@ pub const FUNDING_PROVIDERS: &[FundingProvider] = &[FundingProvider {
 /// over the cycles the canister is created with.
 pub const CREATE_FEE: u128 = 100_000_000;
 
-/// What an agent does with a provider, whichever it is: the steps
-/// `icp_funding_options` returns with every answer. They name tools of this
-/// server and nothing of any provider.
+/// What an agent does with a provider, whichever it is: the steps a deploy
+/// that ran short answers with. They name tools of this server and nothing
+/// of any provider.
 pub const STEPS: &[&str] = &[
-    "Tell the user the balance and what is missing, show them the providers, and let them pick \
-     one and how much to buy. Which provider and how much are theirs to decide.",
+    "Write `canister_ids` back to the project first: it holds what this deploy did create, \
+     and the next deploy creates only what is missing.",
+    "Tell the user what is missing, show them the providers, and let them pick one and how \
+     much to buy. Which provider and how much are theirs to decide.",
     "Call open_app with that provider's `app_url`, then get_canister_api_doc on the canister it \
      marks [declared] for orders. That guide is the provider's own: it says how to quote a \
      price and how to make an order.",
@@ -104,8 +123,8 @@ pub const STEPS: &[&str] = &[
      payment and answers a payment URL.",
     "Give the user that URL as it is. They confirm one payment there, on the provider's page; \
      never ask for card details, which go to that page alone.",
-    "Read the order's status as the guide says until the cycles are delivered, or call this \
-     tool again for the balance. Then call icp_deploy.",
+    "Read the order's status as the guide says until the cycles are delivered. Then call \
+     icp_deploy again, with the mapping from the first step.",
 ];
 
 /// What to do when the steps cannot be followed.
@@ -117,27 +136,32 @@ const OTHERWISE: &str = "If open_app marks none of a provider's canisters [decla
 /// the canister a deploy is creating (matched in lowercase).
 const SHORT_OF_CYCLES: &str = "insufficient cycles";
 
-/// What a deploy that ran short of cycles is told next, after its error.
-const SHORT_OF_CYCLES_HINT: &str = "To add cycles: icp_funding_options reports the balance and \
-    where the user can buy more. Write `canister_ids` back first, so that the next deploy \
-    creates only what is still missing.";
+/// How long a deploy that ran short waits to learn the balance as it now
+/// is. The answer says where cycles are sold with or without it.
+const BALANCE_WAIT: Duration = Duration::from_secs(10);
 
-/// Arguments of `icp_funding_options`.
-#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
-pub struct FundingOptionsArgs {
-    /// How many canisters the deploy will create: those the project's
-    /// environment declares that its canister-id mapping does not name yet.
-    /// With it the answer says what the deploy needs and how much is
-    /// missing. Omit it for the balance and the providers alone.
-    #[serde(default)]
-    pub canisters: Option<u32>,
-    /// Cycles each new canister is created with: the `cycles` icp_deploy
-    /// will be called with. Default 2 trillion, as there.
-    #[serde(default)]
-    pub cycles: Option<u64>,
+/// The sentence `icp_deploy`'s description ends with: where cycles are sold,
+/// from the list, so that the two cannot differ.
+pub fn advertised() -> String {
+    let providers: Vec<String> =
+        FUNDING_PROVIDERS.iter().map(|p| format!("{} ({})", p.name, p.app_url)).collect();
+    format!(" Cycles are sold at: {}.", providers.join(", "))
 }
 
-/// A funding provider, as `icp_funding_options` returns it.
+/// Whether `outcome` is that of a deploy the balance did not cover: one that
+/// failed, with the cycles ledger's refusal in its error or in the log's
+/// line for the canister it could not create. A deploy that was interrupted
+/// is not one, whatever its log says.
+pub(super) fn ran_short(outcome: &DeployOutcome) -> bool {
+    outcome.status == Status::Failed
+        && outcome
+            .error
+            .iter()
+            .chain(&outcome.log)
+            .any(|line| line.to_ascii_lowercase().contains(SHORT_OF_CYCLES))
+}
+
+/// A funding provider, as a deploy's answer returns it.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct FundingProviderOutput {
     /// The provider's name.
@@ -148,21 +172,23 @@ pub struct FundingProviderOutput {
     pub pays_with: String,
 }
 
-/// Structured result of `icp_funding_options`.
+/// How to fund a deploy the cycles balance did not cover: part of
+/// `icp_deploy`'s answer when it failed for that.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct FundingOptions {
+pub struct Funding {
     /// The principal icp_deploy creates canisters as. Its Cycles Ledger
     /// account holds the balance, and is the account an order must credit.
     pub principal: String,
-    /// That account's balance, in cycles (decimal digits).
-    pub balance: String,
-    /// What a deploy creating `canisters` canisters takes from the balance,
-    /// in cycles: each canister's cycles and the ledger's fee for creating
-    /// it. Absent when `canisters` was not given.
+    /// What creating the canisters this deploy did not create takes from
+    /// the balance, in cycles (decimal digits): each canister's cycles and
+    /// the ledger's fee for creating it.
+    pub needed: String,
+    /// The account's balance after the deploy, in cycles. Absent when it
+    /// could not be read.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub needed: Option<String>,
-    /// How many cycles of `needed` the balance does not cover; "0" when it
-    /// covers them. Absent when `canisters` was not given.
+    pub balance: Option<String>,
+    /// How many cycles of `needed` the balance does not cover: what the
+    /// user has to buy, at the least. Absent when the balance is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shortfall: Option<String>,
     /// Where the user can buy cycles.
@@ -171,19 +197,22 @@ pub struct FundingOptions {
     pub steps: Vec<String>,
 }
 
-impl FundingOptions {
-    /// The answer for `principal`, whose account holds `balance` cycles,
-    /// asked about a deploy that creates what `args` says.
-    pub fn new(principal: String, balance: u128, args: &FundingOptionsArgs) -> Self {
-        let needed = args.canisters.map(|canisters| {
-            let each = u128::from(args.cycles.unwrap_or(DEFAULT_CYCLES));
-            u128::from(canisters).saturating_mul(each.saturating_add(CREATE_FEE))
-        });
+impl Funding {
+    /// What funding takes for `principal`, whose deploy left `to_create`
+    /// canisters uncreated at `cycles` each, and whose account holds
+    /// `balance` now, if that is known.
+    pub fn new(
+        principal: Principal,
+        to_create: usize,
+        cycles: u128,
+        balance: Option<u128>,
+    ) -> Self {
+        let needed = (to_create as u128).saturating_mul(cycles.saturating_add(CREATE_FEE));
         Self {
-            principal,
-            balance: balance.to_string(),
-            needed: needed.map(|n| n.to_string()),
-            shortfall: needed.map(|n| n.saturating_sub(balance).to_string()),
+            principal: principal.to_text(),
+            needed: needed.to_string(),
+            balance: balance.map(|b| b.to_string()),
+            shortfall: balance.map(|b| needed.saturating_sub(b).to_string()),
             providers: FUNDING_PROVIDERS
                 .iter()
                 .map(|p| FundingProviderOutput {
@@ -196,22 +225,45 @@ impl FundingOptions {
         }
     }
 
-    /// The human-readable rendering: the balance and whose it is, what is
-    /// missing, the providers, the steps.
+    /// What funding takes after `outcome`, a deploy as `principal` that
+    /// created canisters with `cycles` each and ran short. The balance is
+    /// read as it now is, or left out if the ledger does not answer in time.
+    pub(super) async fn after(outcome: &DeployOutcome, principal: Principal, cycles: u128) -> Self {
+        let balance = match tokio::time::timeout(BALANCE_WAIT, balance_of(principal)).await {
+            Ok(Ok(balance)) => Some(balance),
+            Ok(Err(e)) => {
+                tracing::warn!("the cycles balance could not be read: {e}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("the cycles balance was not read in time");
+                None
+            }
+        };
+        Self::new(principal, still_to_create(outcome), cycles, balance)
+    }
+
+    /// The human-readable rendering: what is missing, whose account, the
+    /// providers, the steps.
     pub fn human(&self) -> String {
         let mut text = format!(
-            "Cycles for deploys: {}, on the Cycles Ledger account of {}, the principal \
-             icp_deploy creates canisters as.",
-            amount(&self.balance),
-            self.principal
+            "The cycles balance did not cover this deploy. Creating the canisters still \
+             missing takes {}",
+            amount(&self.needed)
         );
-        if let (Some(needed), Some(shortfall)) = (&self.needed, &self.shortfall) {
-            text.push_str(&format!("\nThe deploy asked about needs {}: ", amount(needed)));
-            text.push_str(&match shortfall.as_str() {
-                "0" => "the balance covers it.".to_string(),
-                short => format!("{} short.", amount(short)),
-            });
+        match (&self.balance, &self.shortfall) {
+            (Some(balance), Some(shortfall)) => text.push_str(&format!(
+                "; the balance is {}, so at least {} more are needed.",
+                amount(balance),
+                amount(shortfall)
+            )),
+            _ => text.push('.'),
         }
+        text.push_str(&format!(
+            "\nThe balance is that of the Cycles Ledger account of {}, the principal \
+             icp_deploy creates canisters as: bought cycles must be delivered there.",
+            self.principal
+        ));
         text.push_str("\n\nWhere the user can buy cycles:");
         for provider in &self.providers {
             text.push_str(&format!(
@@ -228,9 +280,24 @@ impl FundingOptions {
     }
 }
 
+/// How many canisters `outcome`'s deploy has yet to create: those it
+/// targeted and has no id for.
+fn still_to_create(outcome: &DeployOutcome) -> usize {
+    outcome.canisters.iter().filter(|c| !outcome.canister_ids.contains_key(*c)).count()
+}
+
+/// The cycles-ledger balance of `principal` on the Internet Computer, which
+/// anyone may read: asked anonymously, so that it is answered whatever
+/// became of the session's delegation while the deploy ran.
+async fn balance_of(principal: Principal) -> Result<u128, String> {
+    let agent = mainnet_agent(Arc::new(AnonymousIdentity))?;
+    let balance = cycles_balance_of(&agent, principal).await?.balance;
+    parse_cycles(&balance).ok_or_else(|| format!("the cycles ledger answered '{balance}'"))
+}
+
 /// A cycles ledger balance as [`crate::CyclesBalance`] carries it, which is
 /// Candid's rendering of a `nat`: digits grouped by underscores.
-pub(super) fn parse_cycles(balance: &str) -> Option<u128> {
+fn parse_cycles(balance: &str) -> Option<u128> {
     balance.replace('_', "").parse().ok()
 }
 
@@ -245,8 +312,8 @@ fn amount(cycles: &str) -> String {
 }
 
 /// `cycles` in trillions, to four decimal places — the cycles ledger's fee
-/// is one ten-thousandth of a trillion — rounded down, so that a balance is
-/// never shown as more than it is, and without trailing zeros.
+/// is one ten-thousandth of a trillion — rounded down, and without trailing
+/// zeros.
 fn trillions(cycles: u128) -> String {
     const T: u128 = 1_000_000_000_000;
     let (whole, fraction) = (cycles / T, cycles % T / (T / 10_000));
@@ -256,27 +323,25 @@ fn trillions(cycles: u128) -> String {
     }
 }
 
-/// `error`, the reason a deploy gave for failing, followed by where cycles
-/// are to be had when what it failed for is the balance: said in the error
-/// itself or in a line of the deploy's `log`. Any other error is returned as
-/// it is.
-pub(super) fn with_funding_hint(error: &str, log: &[String]) -> String {
-    let short = std::iter::once(error)
-        .chain(log.iter().map(String::as_str))
-        .any(|line| line.to_ascii_lowercase().contains(SHORT_OF_CYCLES));
-    match short {
-        true => format!("{error}\n{SHORT_OF_CYCLES_HINT}"),
-        false => error.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn asked(canisters: Option<u32>, cycles: Option<u64>) -> FundingOptionsArgs {
-        FundingOptionsArgs { canisters, cycles }
+    fn outcome(status: Status, error: &str, log: &[&str]) -> DeployOutcome {
+        DeployOutcome {
+            status,
+            environment: "ic".into(),
+            network: "ic".into(),
+            canisters: vec!["backend".into(), "frontend".into(), "worker".into()],
+            created: vec![("backend".into(), Principal::management_canister())],
+            canister_ids: [("backend".to_string(), Principal::management_canister())].into(),
+            error: Some(error.into()),
+            log: log.iter().map(|l| (*l).to_string()).collect(),
+        }
     }
+
+    const LEDGER: &str = "Insufficient cycles. Requested: 2000000000000 cycles, available \
+                          balance: 5 cycles.";
 
     // An entry is an app URL and two phrases for the user: an https origin
     // as `open_app` takes one, with nothing after the host, and no two
@@ -298,60 +363,92 @@ mod tests {
         }
     }
 
-    // What a deploy needs is each canister's cycles and the ledger's fee for
-    // creating it; what is missing is that less the balance, and never less
-    // than nothing. Not asked about a deploy, the answer says neither.
+    // The deploy tool's description names every provider with its URL, from
+    // the list.
     #[test]
-    fn the_shortfall_is_what_the_balance_does_not_cover() {
-        let none = FundingOptions::new("aaaaa-aa".into(), 5, &asked(None, None));
-        assert_eq!((none.balance.as_str(), &none.needed, &none.shortfall), ("5", &None, &None));
+    fn the_description_names_every_provider() {
+        let said = advertised();
+        assert!(said.starts_with(" Cycles are sold at: ") && said.ends_with('.'), "{said}");
+        for provider in FUNDING_PROVIDERS {
+            assert!(said.contains(&format!("{} ({})", provider.name, provider.app_url)));
+        }
+    }
 
-        let short = FundingOptions::new("aaaaa-aa".into(), 350_000_000_000, &asked(Some(2), None));
-        assert_eq!(short.needed.as_deref(), Some("4000200000000"));
+    // A deploy ran short when the ledger said so, wherever the library put
+    // its words: in the error, or in the log's line for the canister it
+    // could not create. Any other failure did not, and neither did a deploy
+    // that was stopped.
+    #[test]
+    fn a_deploy_ran_short_when_the_ledger_said_so() {
+        let create = format!("  create frontend: failed: {LEDGER}");
+        assert!(ran_short(&outcome(Status::Failed, &format!("create failed: {LEDGER}"), &[])));
+        assert!(ran_short(&outcome(Status::Failed, "one canister failed", &[&create])));
+        assert!(!ran_short(&outcome(Status::Failed, "install_code rejected", &["create: ok"])));
+        assert!(!ran_short(&outcome(Status::Interrupted, "stopped", &[&create])));
+        let mut deployed = outcome(Status::Deployed, "", &[&create]);
+        deployed.error = None;
+        assert!(!ran_short(&deployed));
+    }
+
+    // What is needed is each uncreated canister's cycles and the ledger's
+    // fee for creating it; what is missing is that less the balance, and
+    // never less than nothing. A balance that could not be read leaves both
+    // out and the rest stands.
+    #[test]
+    fn what_is_missing_is_what_the_balance_does_not_cover() {
+        let who = Principal::management_canister();
+        let short = Funding::new(who, 2, 2_000_000_000_000, Some(350_000_000_000));
+        assert_eq!(short.principal, "aaaaa-aa");
+        assert_eq!(short.needed, "4000200000000");
+        assert_eq!(short.balance.as_deref(), Some("350000000000"));
         assert_eq!(short.shortfall.as_deref(), Some("3650200000000"));
 
-        let covered = FundingOptions::new(
-            "aaaaa-aa".into(),
-            3_000_000_000_000,
-            &asked(Some(1), Some(1_000_000_000_000)),
-        );
-        assert_eq!(covered.needed.as_deref(), Some("1000100000000"));
+        // Topped up meanwhile: nothing is missing any more.
+        let covered = Funding::new(who, 1, 1_000_000_000_000, Some(3_000_000_000_000));
+        assert_eq!(covered.needed, "1000100000000");
         assert_eq!(covered.shortfall.as_deref(), Some("0"));
 
-        // Nothing to create needs nothing, and numbers no deploy has do not
-        // wrap.
-        let nothing = FundingOptions::new("aaaaa-aa".into(), 0, &asked(Some(0), None));
-        assert_eq!(nothing.shortfall.as_deref(), Some("0"));
-        let huge =
-            FundingOptions::new("aaaaa-aa".into(), 0, &asked(Some(u32::MAX), Some(u64::MAX)));
-        assert!(huge.needed.is_some_and(|n| n.parse::<u128>().is_ok()));
+        let unread = Funding::new(who, 2, 2_000_000_000_000, None);
+        assert_eq!(unread.needed, "4000200000000");
+        assert_eq!((&unread.balance, &unread.shortfall), (&None, &None));
+        assert_eq!(unread.providers.len(), FUNDING_PROVIDERS.len());
+
+        // Numbers no deploy has do not wrap.
+        let huge = Funding::new(who, usize::MAX, u128::MAX, Some(0));
+        assert_eq!(huge.needed, u128::MAX.to_string());
+    }
+
+    // The canisters still to create are those the deploy targeted and has
+    // no id for: here two of three, the first having been created before
+    // the balance ran out.
+    #[test]
+    fn the_canisters_still_to_create_are_those_without_an_id() {
+        assert_eq!(still_to_create(&outcome(Status::Failed, LEDGER, &[])), 2);
     }
 
     // The text an agent without structured content reads carries the whole
-    // answer: whose account, how much, what is missing, each provider with
-    // its URL, and the steps in order.
+    // answer: what is missing, whose account, each provider with its URL,
+    // and the steps in order.
     #[test]
     fn the_text_says_what_the_structure_does() {
-        let options =
-            FundingOptions::new("abcde-cai".into(), 350_000_000_000, &asked(Some(2), None));
-        let text = options.human();
-        assert!(text.contains("0.35T (350000000000 cycles)"), "{text}");
-        assert!(text.contains("account of abcde-cai"), "{text}");
-        assert!(text.contains("needs 4.0002T (4000200000000 cycles): 3.6502T"), "{text}");
+        let who = Principal::management_canister();
+        let text = Funding::new(who, 2, 2_000_000_000_000, Some(350_000_000_000)).human();
+        assert!(text.contains("takes 4.0002T (4000200000000 cycles)"), "{text}");
+        assert!(text.contains("; the balance is 0.35T (350000000000 cycles)"), "{text}");
+        assert!(text.contains("at least 3.6502T (3650200000000 cycles) more"), "{text}");
+        assert!(text.contains("account of aaaaa-aa"), "{text}");
         for provider in FUNDING_PROVIDERS {
             assert!(text.contains(&format!("- {} ({})", provider.name, provider.app_url)));
         }
         let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("no `{needle}`"));
-        assert!(at("1. Tell the user") < at("2. Call open_app"), "{text}");
-        assert!(at("get_canister_api_doc") < at("payment URL"), "{text}");
-        assert!(at("payment URL") < at("Then call icp_deploy"), "{text}");
+        assert!(at("1. Write `canister_ids` back") < at("2. Tell the user"), "{text}");
+        assert!(at("3. Call open_app") < at("payment URL"), "{text}");
+        assert!(at("payment URL") < at("Then call icp_deploy again"), "{text}");
         assert!(text.contains("on the provider's site"), "{text}");
 
-        let covered =
-            FundingOptions::new("abcde-cai".into(), 9_000_000_000_000, &asked(Some(1), None));
-        assert!(covered.human().contains("the balance covers it"));
-        let unasked = FundingOptions::new("abcde-cai".into(), 0, &asked(None, None));
-        assert!(!unasked.human().contains("needs"), "{}", unasked.human());
+        let unread = Funding::new(who, 1, 2_000_000_000_000, None).human();
+        assert!(unread.contains("takes 2.0001T (2000100000000 cycles)."), "{unread}");
+        assert!(!unread.contains("; the balance is"), "no balance was read: {unread}");
     }
 
     // The steps are the same for every provider: they name this server's
@@ -367,8 +464,8 @@ mod tests {
         for provider in FUNDING_PROVIDERS {
             assert!(!steps.contains(provider.name), "{}", provider.name);
         }
-        for theirs in ["create_order", "Stripe", "cyclepay"] {
-            assert!(!steps.to_ascii_lowercase().contains(&theirs.to_ascii_lowercase()));
+        for theirs in ["create_order", "stripe", "cyclepay"] {
+            assert!(!steps.to_ascii_lowercase().contains(theirs), "{theirs}");
         }
     }
 
@@ -388,24 +485,5 @@ mod tests {
         assert_eq!(parse_cycles("2_000_000_000_000"), Some(2_000_000_000_000));
         assert_eq!(parse_cycles("0"), Some(0));
         assert_eq!(parse_cycles("two"), None);
-    }
-
-    // A deploy that failed for lack of cycles is told where to get them,
-    // wherever the library said so: in the error, or in the log's line for
-    // the canister it could not create. Any other failure reads as it did.
-    #[test]
-    fn a_deploy_short_of_cycles_is_told_of_the_funding_options() {
-        let ledger = "Insufficient cycles. Requested: 2000000000000 cycles, available balance: \
-                      5 cycles.";
-        let in_error = with_funding_hint(&format!("create failed: {ledger}"), &[]);
-        assert!(in_error.starts_with("create failed: Insufficient cycles"), "{in_error}");
-        assert!(in_error.contains("icp_funding_options"), "{in_error}");
-
-        let log = vec![format!("  create backend: failed: {ledger}")];
-        let in_log = with_funding_hint("one canister failed", &log);
-        assert!(in_log.contains("icp_funding_options"), "{in_log}");
-
-        let other = with_funding_hint("install_code rejected", &["  create backend: ok".into()]);
-        assert_eq!(other, "install_code rejected");
     }
 }

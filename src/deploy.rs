@@ -993,7 +993,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        for tool in ["open_app", "icp_deploy", "icp_deploy_upload", "icp_funding_options"] {
+        for tool in ["open_app", "icp_deploy", "icp_deploy_upload"] {
             assert!(names.contains(&tool), "{tool} must be listed: {names:?}");
         }
         assert!(!names.contains(&"authenticate"), "no login tool on the hosted server");

@@ -6,17 +6,19 @@ was built, why this shape, and what was left out.
 ## Summary
 
 `icp_deploy` creates canisters from the user's cycles balance, and a user
-deploying for the first time has none. The server now says where cycles can
-be bought, without knowing how any one seller takes an order:
+deploying for the first time has none. The deploy tool now says where cycles
+can be bought, without the server knowing how any one seller takes an order
+and without a tool of its own:
 
 - **A funding provider is an app, named by its URL.** The server keeps a
   short list of them (`FUNDING_PROVIDERS`), CyclePay first.
 - **How to order is the provider's to say**, through the
   [service-discoverability](https://docs.internetcomputer.org/guides/frontends/service-discoverability/)
   layers the server already reads for every app.
-- **One read-only tool, `icp_funding_options`,** returns the balance, the
-  principal bought cycles must be delivered to, the providers, and the steps
-  that are the same for all of them.
+- **`icp_deploy` advertises them.** Its description names where cycles are
+  sold, and a deploy the balance did not cover answers with `funding`: the
+  principal bought cycles must be delivered to, what is missing, the
+  providers, and the steps that are the same for all of them.
 - **Whichever provider, the user gets one URL** on which they confirm a
   single payment (a Stripe page, for CyclePay). Then `icp_deploy` works.
 
@@ -28,24 +30,24 @@ financial guard on `canister_update_call` is unchanged.
 `icp_deploy` signs as the user's default Internet Identity account at
 `https://cli.id.ai` and creates each new canister from that principal's
 Cycles Ledger balance (2T cycles by default). When the balance is short, the
-deploy fails at its first creation with the icp library's message, which
-points at `icp cycles mint`: a terminal command, for a user who came through
-a chat client and may have no terminal.
+deploy fails at a creation with the icp library's message, which points at
+`icp cycles mint`: a terminal command, for a user who came through a chat
+client and may have no terminal.
 
-Three things were missing for an agent to help:
+Two things were missing for an agent to help:
 
-1. **How much is there?** Nothing served reported the deploy balance (a
-   balance tool existed next to the deploy tools and was dropped in #266).
-2. **Whose account?** The deploy principal is not the user's principal in
+1. **Whose account?** The deploy principal is not the user's principal in
    any app, so cycles bought "for me" in a seller's app land where
-   `icp_deploy` cannot spend them.
-3. **Where to buy?** The server had no word on it. Its instructions said
+   `icp_deploy` cannot spend them. Nothing served named it.
+2. **Where to buy?** The server had no word on it. Its instructions said
    that nothing here funds a canister.
 
 The constraints: CyclePay is the first provider and will not be the only
-one; the server's policy is that it performs no financial operation; and the
-change is confined to this repository, so nothing can be asked of a
-provider that it does not already publish.
+one; the server's policy is that it performs no financial operation; the
+tool surface is kept small (a balance tool and a guide tool were dropped
+from the deploy group in #266); and the change is confined to this
+repository, so nothing can be asked of a provider that it does not already
+publish.
 
 ## What service discoverability already gives
 
@@ -108,22 +110,39 @@ The third is the policy doing its work, and no exemption was added for it.
 An order that records what the user is about to pay for passes; a method
 that paid would not, and should not.
 
-### 2. The tool
+### 2. Where `icp_deploy` says it
 
-`icp_funding_options` (`canisters?`, `cycles?`), read-only, served wherever
-`icp_deploy` is:
+**In its description.** The description says that new canisters are paid
+for from the user's cycles balance and that a deploy short of them answers
+with `funding`, and it ends with a sentence made from the list: "Cycles are
+sold at: CyclePay (https://www.cyclepay.org)." An agent reads it with the
+tool list, so it can tell a user who has no cycles where to get them before
+anything is bundled.
+
+**In the answer of a deploy that ran short.** When the cycles ledger
+refuses a creation, the deploy fails as before, with the mapping of what it
+did create, and with `funding`:
 
 | Field | |
 |---|---|
 | `principal` | The deploy principal. Its Cycles Ledger account holds the balance and is the account an order must credit. |
-| `balance` | That account's balance, in cycles. |
-| `needed`, `shortfall` | With `canisters`: `canisters × (cycles + ledger fee)`, and what of it the balance does not cover. Computed here, since thirteen-digit arithmetic is not what a model is good at. |
+| `needed` | `to create × (cycles + ledger fee)`, for the canisters the deploy targeted and has no id for. The server counts them: it has read the bundle and the mapping, and thirteen-digit arithmetic is not what a model is good at. |
+| `balance`, `shortfall` | The balance read after the deploy, anonymously, and what of `needed` it does not cover. Left out if the ledger does not answer within ten seconds; the rest stands. |
 | `providers` | The list. |
-| `steps` | What to do with a provider, the same five for every one. |
+| `steps` | What to do with a provider, the same six for every one. |
 
-It needs a signed-in session, to know whose balance, and no more than
-"Questions only". It reads the Cycles Ledger and nothing else: providers are
-not contacted, so an answer does not depend on any of them being up.
+**Why only then.** `funding` is attached when the ledger itself said
+`Insufficient cycles`, never on a balance checked ahead of the deploy. The
+icp library creates a canister through the Cycles Ledger on an ordinary
+subnet and through an engine operator on a cloud engine, where the ledger
+balance is not what pays. Which of the two a deploy takes depends on the
+subnet it resolves, so a preflight on the balance would refuse deploys that
+were going to succeed. The ledger's own refusal is never wrong about that.
+
+The cost: a user with no cycles learns it from a failed deploy. Nothing is
+created by a deploy that cannot afford its first canister, and one that can
+afford some keeps them, as before. On the hosted server the upload is spent
+by that deploy, so the bundle is uploaded a second time after paying.
 
 ### 3. The flow
 
@@ -136,10 +155,12 @@ sequenceDiagram
     participant S as Provider's payment page (Stripe)
     participant L as Cycles Ledger
 
-    A->>M: icp_funding_options(canisters = 2)
+    A->>M: icp_deploy
+    M->>L: create canister
+    L-->>M: Insufficient cycles
     M->>L: balance of the deploy principal
-    M-->>A: principal, balance, shortfall, providers, steps
-    A->>U: balance, shortfall, the providers
+    M-->>A: failed, canister_ids, funding (principal, needed, shortfall, providers, steps)
+    A->>U: what is missing, the providers
     U-->>A: CyclePay, $10
     A->>M: open_app(provider's app_url)
     M->>P: /.well-known/ic-architecture
@@ -154,33 +175,44 @@ sequenceDiagram
     S->>P: paid
     P->>L: cycles to the deploy principal's account
     A->>M: canister_query: order status, until delivered
-    A->>M: icp_deploy
-    M->>L: create canisters from the balance
+    A->>M: icp_deploy, with the mapping of the first
+    M->>L: create the canisters still missing
 ```
 
-Everything above the order is reading. The order is the one state-changing
-call, made as the user's account at the provider, under an "Actions &
-questions" session, through the guard. The payment is the user's, on a page
-that is neither the server's nor the agent's.
+The order is the one state-changing call of the funding, made as the user's
+account at the provider, under an "Actions & questions" session, through
+the guard. The payment is the user's, on a page that is neither the
+server's nor the agent's.
 
-The steps the tool returns name this server's tools and the deploy
+The steps the answer carries name this server's tools and the deploy
 principal, and nothing of any provider (a test holds them to that). What
 differs between providers, the agent reads from the provider.
 
-### 4. `icp_deploy`'s part
+### 4. Around the tool
 
-- Its description and the server's instructions say where the balance is
-  reported.
-- A deploy that fails for lack of cycles says so with a pointer to
-  `icp_funding_options` appended to its `error`, which both the text and
-  the structured content carry. The mapping it returns still holds what it
-  did create; the retry after funding creates the rest.
-- The `deploy-with-mcp` skill has a section on checking the cycles before
-  bundling: on the hosted server an upload is held five minutes, less than a
-  payment takes, so funding comes first.
+- The server's instructions say, in one sentence, that a deploy short of
+  cycles answers with `funding` and that the user pays on the provider's
+  page.
+- The `deploy-with-mcp` skill has "When the cycles run short", and a
+  pitfall on crediting the wrong account.
 
 ## What was considered and left out
 
+- **A tool of its own** (`icp_funding_options`: the balance, what a deploy
+  of N canisters needs, the providers). It was the first version of this
+  change. It let an agent check before bundling and spared the second
+  upload, at the price of one more tool on a surface that is kept small, a
+  count of new canisters the agent had to make itself, and a balance that
+  says nothing certain about a deploy to a cloud engine. The deploy tool
+  knows all three better.
+- **The balance with the upload ticket** (`icp_deploy_upload` reading the
+  ledger as it mints). It would spare the second upload on the hosted
+  server. It would also turn a tool that touches nothing outside the server
+  into one that waits on Internet Identity and the ledger before every
+  upload, for a number that can only advise. Worth revisiting if failed
+  first deploys prove costly.
+- **A preflight in `icp_deploy`** that refuses before creating anything.
+  See "Why only then".
 - **A server-side adapter per provider** (`icp_buy_cycles(provider,
   amount)` returning the URL in one call). Fewer steps for the agent, but
   provider code in the server, a release for every change a provider makes
@@ -189,18 +221,11 @@ differs between providers, the agent reads from the provider.
 - **A deep link per provider** (CyclePay's `llms.txt` documents
   `/b/<principal>/<usd>`). No update call at all, but a provider-specific
   URL template in the list, a landing page in place of a payment page, and
-  no order to follow to delivery. It survives as the
-  fallback in words: "the user can still buy on the provider's site,
-  entering `principal`".
+  no order to follow to delivery. It survives as the fallback in words:
+  "the user can still buy on the provider's site, entering `principal`".
 - **A funding section in the manifest, or an on-chain registry of
   sellers.** Both are changes outside this repository, and a registry
   anyone can join is not a list this server should recommend from.
-- **Asking each provider whether it is up** before listing it. `open_app`
-  does that at the next step, and says which canisters are declared.
-- **A preflight in `icp_deploy`** that refuses before creating anything. It
-  would have to read the bundle to know how many canisters are new, after
-  the upload is spent. The agent asks first; a deploy that runs short keeps
-  what it created.
 - **Operator-configured providers** (an environment variable). The list is
   an endorsement; it changes by review.
 - **CyclePay's escrow orders** (`escrow_spender` in its API doc). They hold
@@ -209,9 +234,9 @@ differs between providers, the agent reads from the provider.
 
 ## Security and policy
 
-- **No financial operation is added.** The tool reads a balance and returns
-  a list. The order is a `canister_update_call` like any other, refused
-  under exactly the conditions it was refused under before.
+- **No financial operation is added.** The deploy tool names an account and
+  returns a list. The order is a `canister_update_call` like any other,
+  refused under exactly the conditions it was refused under before.
 - **The payment URL is the provider's.** The server cannot tell a good one
   from a bad one without knowing the provider, which is what it avoids. The
   defences are the reviewed list, the manifest (publishing it is the
@@ -220,8 +245,8 @@ differs between providers, the agent reads from the provider.
   would add a mechanical check at the price of one provider-specific fact;
   it is the first thing to add if this proves too thin.
 - **The wrong account is the likely mistake.** An order that credits its
-  caller delivers to the user's principal at the provider. The tool's
-  answer, its steps and the skill each say to name `principal`.
+  caller delivers to the user's principal at the provider. The answer, its
+  steps and the skill each say to name `principal`.
 - **What a provider learns**: the user's principal in its app (as for any
   app the user acts in) and the deploy principal, as the account credited.
   Card details go to the provider's payment processor and reach neither the
@@ -229,21 +254,21 @@ differs between providers, the agent reads from the provider.
 
 ## Not done here
 
-- **A paid order end to end.** The read path was exercised live; an order
-  and a payment were not. Worth one run on staging before release, with
-  attention to how an agent, given only the tool's answer, names the
-  beneficiary.
+- **A paid order end to end.** The read path was exercised live; a deploy
+  that runs short, an order and a payment were not. Worth one run on
+  staging before release, with attention to how an agent, given only the
+  deploy's answer, names the beneficiary.
 - **Topping up a canister that already exists.** The same providers do it
-  (CyclePay takes a `Canister` destination), and the tool says nothing of
-  it: it reports the deploy balance. A sentence in the skill would cover it
-  once someone needs it.
+  (CyclePay takes a `Canister` destination), and nothing here speaks of it:
+  `funding` is about the balance deploys create from. A sentence in the
+  skill would cover it once someone needs it.
 
 ## Where it lives
 
 | | |
 |---|---|
-| `crates/imcp2-core/src/deploy/funding.rs` | The list, the tool's output and steps, the shortfall, the hint a short deploy gets; tests. |
-| `crates/imcp2-core/src/deploy/mod.rs` | `icp_funding_options` in the deploy tool group. |
+| `crates/imcp2-core/src/deploy/funding.rs` | The list, the sentence of the description, when a deploy ran short, the `funding` answer and its steps; tests. |
+| `crates/imcp2-core/src/deploy/mod.rs` | `icp_deploy`: the description, `funding` in the output, attached after a deploy the ledger refused. |
 | `crates/imcp2-core/src/deploy/server.rs` | One sentence in the server's instructions. |
-| `crates/imcp2-core/static/skills/deploy-with-mcp.md` | "Before a deploy that creates canisters: check the cycles". |
+| `crates/imcp2-core/static/skills/deploy-with-mcp.md` | "When the cycles run short". |
 | `README.md`, `crates/imcp2-local/README.md` | "Funding a deploy". |

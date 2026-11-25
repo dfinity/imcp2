@@ -185,13 +185,14 @@ not the management identity the canister lifecycle tools act as (see
 add their principal as a controller. The session must have been granted
 "Actions & questions" at sign-in.
 
-Before a deploy that will create canisters, `icp_funding_options` reports
-the cycles balance of that principal, what the deploy needs, and where you
-can buy cycles when the balance is short (CyclePay, by card, to begin with).
-The server takes no payment: the agent makes an order with the provider you
+A deploy your cycles balance does not cover fails and says how to fund it:
+the principal whose Cycles Ledger account to credit, what the canisters
+still to create need, and where you can buy cycles (CyclePay, by card, to
+begin with; the tool's description names the same places up front). The
+server takes no payment: the agent makes an order with the provider you
 pick, through the provider's own published interface, and hands you the
 payment URL it answers; you confirm one payment on the provider's page, and
-the cycles arrive on the account the deploy spends from. The repository
+the cycles arrive on the account the next deploy spends from. The repository
 README's "Funding a deploy" has the details.
 
 One deploy runs at a time: a second call while one is running is refused

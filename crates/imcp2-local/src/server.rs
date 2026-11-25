@@ -441,10 +441,9 @@ mod tests {
 
     // A REAL MCP round-trip over an in-process duplex pipe (the same
     // byte-stream shape stdio serves): initialize; tools/list is the merged
-    // surface (the 10 served core tools + the 2 login tools + the deploy and
-    // funding tools); tools/call dispatches login tools to the wrapper, the
-    // deploy and funding tools to their router, and everything else to
-    // IcTools; the login
+    // surface (the 10 served core tools + the 2 login tools + the deploy tool);
+    // tools/call dispatches login tools to the wrapper, the deploy tool to its
+    // router, and everything else to IcTools; the login
     // lifecycle (signed out → link → pending) runs through the MCP layer —
     // all with no network and no browser.
     #[tokio::test]
@@ -469,8 +468,8 @@ mod tests {
         // without the principal it signs as or how many deploys it runs.
         assert!(instructions.contains("DEPLOYING. `icp_deploy` deploys"), "{instructions}");
         assert!(instructions.contains("`bundle_path`"), "{instructions}");
-        // And where the cycles for it are reported, and bought.
-        assert!(instructions.contains("`icp_funding_options`"), "{instructions}");
+        // And that a deploy short of cycles says how to fund it.
+        assert!(instructions.contains("`funding`"), "{instructions}");
         for gone in ["no tool here", "exception", "cli.id.ai", "icp identity", "at a time"] {
             assert!(!instructions.contains(gone), "`{gone}` in: {instructions}");
         }
@@ -478,20 +477,19 @@ mod tests {
         let tools = client.list_all_tools().await.expect("tools/list");
         assert_eq!(
             tools.len(),
-            14,
-            "10 served core tools + authenticate + auth_status + icp_deploy + \
-             icp_funding_options"
+            13,
+            "10 served core tools + authenticate + auth_status + icp_deploy"
         );
-        for expected in [
-            "get_canister_candid",
-            "canister_query",
-            "authenticate",
-            "auth_status",
-            "icp_deploy",
-            "icp_funding_options",
-        ] {
+        for expected in
+            ["get_canister_candid", "canister_query", "authenticate", "auth_status", "icp_deploy"]
+        {
             assert!(tools.iter().any(|t| &*t.name == expected), "missing {expected}");
         }
+        // The deploy tool is where funding is advertised: its description
+        // names where cycles are sold.
+        let deploy = tools.iter().find(|t| &*t.name == "icp_deploy").expect("icp_deploy");
+        let said = deploy.description.as_deref().unwrap_or_default();
+        assert!(said.contains("Cycles are sold at: CyclePay (https://www.cyclepay.org)"), "{said}");
 
         let call = |name: &'static str, args: Option<serde_json::Value>| {
             let client = &client;
@@ -541,14 +539,6 @@ mod tests {
         .await;
         assert!(is_error, "an invalid canister id is a tool error");
         assert!(text.contains("invalid canister id"), "{text}");
-
-        // The funding tool goes to the deploy router too, and signed out it
-        // has no principal to report a balance for: refused, with no
-        // network touched.
-        let (is_error, text, _) =
-            call("icp_funding_options", Some(serde_json::json!({ "canisters": 2 }))).await;
-        assert!(is_error, "funding options without a session is a tool error");
-        assert!(text.contains("authenticated session"), "{text}");
 
         // The deploy tools dispatch to their own router through the wrapper:
         // signed out, `icp_deploy` refuses before reading the bundle
