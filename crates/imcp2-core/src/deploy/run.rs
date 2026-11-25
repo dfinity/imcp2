@@ -462,7 +462,7 @@ pub async fn deploy_bundle(
     // whether any was made at all: see [`run_until_stopped`].
     let begun = Arc::new(AtomicBool::new(false));
     // The principal that pays for creation, named if it cannot.
-    let sender = identity.sender().ok();
+    let deploy_principal = identity.sender().ok();
     let calls = Deferred::new({
         let (stop, begun) = (watch.stop.clone(), begun.clone());
         move || {
@@ -527,8 +527,10 @@ pub async fn deploy_bundle(
         Some(Err(e)) => {
             outcome.status = Status::Failed;
             let ended = error_chain(&e);
-            outcome.error = Some(match (is_insufficient_cycles(&e), sender) {
-                (true, Some(sender)) => insufficient_cycles(sender, params.cycles, &ended),
+            outcome.error = Some(match (is_insufficient_cycles(&e), deploy_principal) {
+                (true, Some(deploy_principal)) => {
+                    insufficient_cycles(deploy_principal, params.cycles, &ended)
+                }
                 _ => failed_with(&ended),
             });
         }
@@ -712,20 +714,20 @@ fn is_insufficient_cycles(error: &DeployError) -> bool {
 /// `icp_cycles_balance` reports — where to buy cycles for it, and what to do
 /// next. The library's own text, whose advice is the CLI's, follows as the
 /// details.
-fn insufficient_cycles(sender: Principal, cycles: u128, ended: &str) -> String {
+fn insufficient_cycles(deploy_principal: Principal, cycles: u128, ended: &str) -> String {
     let details = ended.split_whitespace().collect::<Vec<_>>().join(" ");
     format!(
         "NOT ENOUGH CYCLES: the deploy could not create canister(s) because the account it \
-         deploys as, principal {sender}, does not have enough cycles. Each new canister is \
-         funded with {cycles} cycles from that account's cycles balance. Tell the user, in these \
-         words or close to them: \"Your deploy account ({sender}) needs more cycles before this \
-         app can be deployed. You can buy cycles by card with CyclePay at \
-         {CYCLEPAY_URL}{sender} — let me know once the payment has gone through and I'll \
-         deploy again.\" Do not retry until the user confirms they have paid. Then deploy \
-         again with the same bundle and with the `canister_ids` returned here (write them back to the \
-         project first): any canister already created is listed there and will not be created \
-         again. Note: this is the deploy account, not the principal `icp_cycles_balance` \
-         reports. Details: {details}"
+         deploys as, principal {deploy_principal}, does not have enough cycles. Each new \
+         canister is funded with {cycles} cycles from that account's cycles balance. Tell the \
+         user, in these words or close to them: \"Your deploy account ({deploy_principal}) \
+         needs more cycles before this app can be deployed. You can buy cycles by card with \
+         CyclePay at {CYCLEPAY_URL}{deploy_principal} — let me know once the payment has gone \
+         through and I'll deploy again.\" Do not retry until the user confirms they have paid. \
+         Then deploy again with the same bundle and with the `canister_ids` returned here \
+         (write them back to the project first): any canister already created is listed there \
+         and will not be created again. Note: this is the deploy account, not the principal \
+         `icp_cycles_balance` reports. Details: {details}"
     )
 }
 
@@ -1887,9 +1889,12 @@ mod tests {
 
     #[test]
     fn running_out_of_cycles_names_the_principal_and_where_to_pay() {
-        let sender = Principal::from_text("2vxsx-fae").unwrap();
-        let said =
-            insufficient_cycles(sender, 2_000_000_000_000, &error_chain(&insufficient_funds()));
+        let deploy_principal = Principal::from_text("2vxsx-fae").unwrap();
+        let said = insufficient_cycles(
+            deploy_principal,
+            2_000_000_000_000,
+            &error_chain(&insufficient_funds()),
+        );
         assert!(said.starts_with("NOT ENOUGH CYCLES: "), "{said}");
         assert!(said.contains("principal 2vxsx-fae"), "{said}");
         assert!(said.contains("https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae "), "{said}");
