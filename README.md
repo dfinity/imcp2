@@ -778,10 +778,14 @@ the deploy tool itself says where cycles come from, twice.
   | `providers` | Where the user can buy cycles: `name`, `app_url`, `pays_with`. |
   | `steps` | What an agent does with a provider, the same for every one. |
 
-`funding` is attached when the cycles ledger itself refused a creation
-(`Insufficient cycles`), never on a balance checked beforehand: a canister
-on a cloud engine is not paid for from the ledger, so a check ahead of the
-deploy would refuse deploys that were going to succeed. The cost is that a
+`funding` is attached when the cycles ledger itself refused a creation and
+a canister is still to create, never on a balance checked beforehand: a
+canister on a cloud engine is not paid for from the ledger, so a check ahead
+of the deploy would refuse deploys that were going to succeed. The refusal
+is known by the icp library's wording of it, which is all the library hands
+on; a failure that merely mentions cycles (an install on a canister that ran
+out, say) carries no `funding`. The balance read gives way to a stop, so a
+server that is stopping does not wait on it. The cost is that a
 user with no cycles learns it from a failed deploy, and on the hosted
 server uploads the bundle a second time after paying.
 
@@ -814,12 +818,17 @@ What this buys:
 - **A provider's manifest is its switch.** The manifest gates every call to
   its canisters, so a provider that takes it down can no longer be ordered
   from through this server, with no release here.
-- **The financial guard is unchanged.** The order goes through
-  `canister_update_call` and its three checks like any other call. A
-  provider can be listed only if its order method moves no assets itself,
-  which is exactly what passes: a name with no financial keyword, on a
-  canister with no ICRC-1 or ICRC-2 method. No payment detail reaches the
-  server or the agent.
+- **The financial guard is unchanged, and it vouches for no provider.** The
+  order goes through `canister_update_call` and its three checks like any
+  other call, with no exemption, and has to pass them to be made here at
+  all: a name with no financial keyword, on a canister with no ICRC-1 or
+  ICRC-2 method. That is not evidence that an order is harmless. The guard
+  cannot tell a bespoke value-moving method under an ordinary name (one that
+  spends an allowance the user gave elsewhere, for instance), as its own
+  description says. So that a provider's order takes no payment and moves no
+  assets is checked when its entry is reviewed, from what the method does,
+  independently of the guard. No payment detail reaches the server or the
+  agent.
 
 [`docs/scoping-cycles-funding.md`](docs/scoping-cycles-funding.md) has the
 design, what an entry in the list takes, and what was left out.

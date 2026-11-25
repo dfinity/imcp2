@@ -95,26 +95,36 @@ provider's to change, and its API doc is read when the order is made.
 
 **What an entry takes.** Listing a provider tells users of this server where
 to spend money, so an entry is added by a reviewed change here, and only for
-a provider of which all three hold:
+a provider of which all four hold:
 
 1. Its `app_url` serves a manifest that declares the canister orders are
    made on, and that canister publishes `candid:service` and an API doc.
 2. The API doc describes an order that names the amount and the principal
    whose Cycles Ledger account is credited, that answers a URL where the
    user confirms one payment, and whose status can be read until delivery.
-3. The order call moves no assets itself, so the guard lets it through: no
+3. The order call itself takes no payment and moves no assets: it records
+   what the user is about to pay for, on a page of the provider's. Whoever
+   reviews the entry checks this independently of the guard, from what the
+   method does: the canister's source where it is published, its interface
+   and API doc, and an order made and watched.
+4. The guard lets the order through, or it could not be made here: no
    financial keyword in the method's name (`pay`, `buy`, `purchase`, …), no
    ICRC-1 or ICRC-2 method on the canister.
 
-The third is the policy doing its work, and no exemption was added for it.
-An order that records what the user is about to pay for passes; a method
-that paid would not, and should not.
+The fourth does not give the third. The guard is a guardrail on the
+standard ledger surface and on financial names, and its own description
+says what it cannot do: tell a bespoke value-moving method under an ordinary
+name, such as one that spends an allowance the user gave somewhere else. A
+provider whose order moved assets under a plain name would pass it. No
+exemption was added for funding, and none of the guard's limits is lifted
+by it; what keeps such a provider off the list is the review of its entry.
 
 ### 2. Where `icp_deploy` says it
 
 **In its description.** The description says that new canisters are paid
-for from the user's cycles balance and that a deploy short of them answers
-with `funding`, and it ends with a sentence made from the list: "Cycles are
+for from the user's cycles balance, a cloud engine's excepted, and that a
+deploy short of them answers with `funding`, which is the time to buy. It
+ends with a sentence made from the list: "Cycles are
 sold at: CyclePay (https://www.cyclepay.org)." An agent reads it with the
 tool list, so it can tell a user who has no cycles where to get them before
 anything is bundled.
@@ -131,13 +141,27 @@ did create, and with `funding`:
 | `providers` | The list. |
 | `steps` | What to do with a provider, the same six for every one. |
 
-**Why only then.** `funding` is attached when the ledger itself said
-`Insufficient cycles`, never on a balance checked ahead of the deploy. The
+**Why only then.** `funding` is attached when the ledger itself refused a
+creation for lack of cycles and a canister is still to create, never on a
+balance checked ahead of the deploy. The
 icp library creates a canister through the Cycles Ledger on an ordinary
 subnet and through an engine operator on a cloud engine, where the ledger
 balance is not what pays. Which of the two a deploy takes depends on the
 subnet it resolves, so a preflight on the balance would refuse deploys that
 were going to succeed. The ledger's own refusal is never wrong about that.
+
+The refusal reaches a deploy as text: the icp library turns the ledger's
+typed error into a message ("Insufficient cycles. Requested: … available
+balance: …") before handing it on, so that message is the signal, matched
+whole. A failure that only mentions cycles (an install on a canister that
+ran out, the ledger refusing a withdrawal) is not taken for it, and a
+deploy with nothing left to create gets no `funding` whatever its error
+says. The description says the same of cloud engines, so that an agent does
+not send a user to buy cycles no deploy has asked for.
+
+The balance is read after the deploy has ended and while it still holds its
+slot, so the read gives way to a stop as well as to its ten seconds: a
+server told to stop answers without the number.
 
 The cost: a user with no cycles learns it from a failed deploy. Nothing is
 created by a deploy that cannot afford its first canister, and one that can
@@ -237,6 +261,13 @@ differs between providers, the agent reads from the provider.
 - **No financial operation is added.** The deploy tool names an account and
   returns a list. The order is a `canister_update_call` like any other,
   refused under exactly the conditions it was refused under before.
+- **The guard's limits are its limits here too.** It does not judge a
+  bespoke value-moving method under an ordinary name, on a provider's
+  canister as on any other. A provider's canister may well carry such
+  methods beside its order (a pull under an allowance the user gave
+  elsewhere, for instance). Listing a provider says nothing of those: the
+  steps send an agent to the order flow of the provider's API doc, and the
+  review of an entry looks at what that doc leads an agent to call.
 - **The payment URL is the provider's.** The server cannot tell a good one
   from a bad one without knowing the provider, which is what it avoids. The
   defences are the reviewed list, the manifest (publishing it is the

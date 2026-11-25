@@ -45,11 +45,14 @@
 //! [`crate::discoverability`]).
 //!
 //! The order call is an ordinary `canister_update_call`, held to that tool's
-//! guard like any other. That is a condition on what can be listed rather
-//! than something to work around: a method that itself moved assets would be
-//! refused by its name or by its canister's interface, and an order that
-//! only records what the user is about to pay for, on a page of the
-//! provider's, is neither.
+//! guard like any other, with no exemption. Passing the guard is what lets
+//! an order be made here at all; it is not what makes a provider fit to
+//! list. The guard refuses the standard ledger methods and the financial
+//! names, and says of itself that it cannot tell a bespoke value-moving
+//! method under another name (see [`crate::compliance`]). That an order
+//! takes no payment and moves no assets is therefore established for each
+//! provider when its entry is reviewed, from what its method does, and never
+//! inferred from the guard having let the call through.
 
 use std::{sync::Arc, time::Duration};
 
@@ -57,6 +60,7 @@ use candid::Principal;
 use ic_agent::identity::AnonymousIdentity;
 use rmcp::schemars;
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 use super::{run::mainnet_agent, DeployOutcome, Status};
 use crate::cycles_balance_of;
@@ -88,9 +92,17 @@ pub struct FundingProvider {
 ///      principal whose Cycles Ledger account is credited, that answers a
 ///      URL where the user confirms one payment, and whose status can be
 ///      read until the cycles are delivered.
-///   3. The order call moves no assets itself, so `canister_update_call`'s
-///      guard lets it through: no financial keyword in the method's name, no
-///      ICRC-1 or ICRC-2 method on the canister.
+///   3. The order call itself takes no payment and moves no assets: it
+///      records what the user is about to pay for, on a page of the
+///      provider's. Whoever reviews the entry checks this independently of
+///      the guard, from what the method does: the canister's source where
+///      it is published, its interface and API doc, and an order made and
+///      watched. The guard passing the call shows nothing of the kind: it
+///      cannot tell a bespoke value-moving method under an ordinary name,
+///      such as one that spends an allowance the user gave elsewhere.
+///   4. `canister_update_call`'s guard does let the order through, or it
+///      could not be made here: no financial keyword in the method's name,
+///      no ICRC-1 or ICRC-2 method on the canister.
 ///
 /// Nothing provider-specific beyond these three fields belongs here. A fee,
 /// a limit or a method name written into this list would go stale the day
@@ -124,7 +136,9 @@ pub const STEPS: &[&str] = &[
     "Give the user that URL as it is. They confirm one payment there, on the provider's page; \
      never ask for card details, which go to that page alone.",
     "Read the order's status as the guide says until the cycles are delivered. Then call \
-     icp_deploy again, with the mapping from the first step.",
+     icp_deploy again with the same environment and settings as this deploy, and the mapping \
+     from the first step. If this server takes the bundle by upload, upload it again first \
+     and pass the new upload id: the upload this deploy was given is spent.",
 ];
 
 /// What to do when the steps cannot be followed.
@@ -132,9 +146,13 @@ const OTHERWISE: &str = "If open_app marks none of a provider's canisters [decla
     session cannot make update calls, the user can still buy on the provider's site, entering \
     `principal` as the Cycles Ledger account to credit.";
 
-/// The icp library's words for a cycles-ledger balance that does not cover
-/// the canister a deploy is creating (matched in lowercase).
-const SHORT_OF_CYCLES: &str = "insufficient cycles";
+/// The icp library's words for the cycles ledger refusing to create a
+/// canister because the balance does not cover it: both are in the one
+/// message, and in no other the library has. (Its refusal of a withdrawal
+/// starts alike and says `balance`, not `available balance`; a canister that
+/// has run out says `out of cycles`.) The library turns the ledger's typed
+/// error into this text before a deploy sees it, so the text is the signal.
+const SHORT_OF_CYCLES: [&str; 2] = ["Insufficient cycles. Requested:", "available balance:"];
 
 /// How long a deploy that ran short waits to learn the balance as it now
 /// is. The answer says where cycles are sold with or without it.
@@ -149,16 +167,20 @@ pub fn advertised() -> String {
 }
 
 /// Whether `outcome` is that of a deploy the balance did not cover: one that
-/// failed, with the cycles ledger's refusal in its error or in the log's
-/// line for the canister it could not create. A deploy that was interrupted
-/// is not one, whatever its log says.
+/// failed with a canister still to create, and with the cycles ledger's
+/// refusal of a creation in its error or in the log's line for that
+/// canister. Cycles mentioned by any other failure (an install, a sync) are
+/// not it, and neither is a deploy with nothing left to create, which no
+/// purchase would help. A deploy that was interrupted is not one either,
+/// whatever its log says.
 pub(super) fn ran_short(outcome: &DeployOutcome) -> bool {
     outcome.status == Status::Failed
+        && still_to_create(outcome) > 0
         && outcome
             .error
             .iter()
             .chain(&outcome.log)
-            .any(|line| line.to_ascii_lowercase().contains(SHORT_OF_CYCLES))
+            .any(|line| SHORT_OF_CYCLES.iter().all(|words| line.contains(words)))
 }
 
 /// A funding provider, as a deploy's answer returns it.
@@ -227,19 +249,17 @@ impl Funding {
 
     /// What funding takes after `outcome`, a deploy as `principal` that
     /// created canisters with `cycles` each and ran short. The balance is
-    /// read as it now is, or left out if the ledger does not answer in time.
-    pub(super) async fn after(outcome: &DeployOutcome, principal: Principal, cycles: u128) -> Self {
-        let balance = match tokio::time::timeout(BALANCE_WAIT, balance_of(principal)).await {
-            Ok(Ok(balance)) => Some(balance),
-            Ok(Err(e)) => {
-                tracing::warn!("the cycles balance could not be read: {e}");
-                None
-            }
-            Err(_) => {
-                tracing::warn!("the cycles balance was not read in time");
-                None
-            }
-        };
+    /// read as it now is, and left out if the ledger does not answer in
+    /// time or `stop` is cancelled first: the deploy still holds its slot,
+    /// and a server told to stop does not wait on a number the answer can
+    /// do without.
+    pub(super) async fn after(
+        outcome: &DeployOutcome,
+        principal: Principal,
+        cycles: u128,
+        stop: &CancellationToken,
+    ) -> Self {
+        let balance = balance_within(BALANCE_WAIT, stop, balance_of(principal)).await;
         Self::new(principal, still_to_create(outcome), cycles, balance)
     }
 
@@ -277,6 +297,33 @@ impl Funding {
         }
         text.push_str(&format!("\n\n{OTHERWISE}"));
         text
+    }
+}
+
+/// `read`'s balance, if it comes within `wait` and before `stop` is
+/// cancelled. A stop already asked for comes first.
+async fn balance_within(
+    wait: Duration,
+    stop: &CancellationToken,
+    read: impl std::future::Future<Output = Result<u128, String>>,
+) -> Option<u128> {
+    tokio::select! {
+        biased;
+        _ = stop.cancelled() => {
+            tracing::info!("stopped before the cycles balance was read");
+            None
+        }
+        read = tokio::time::timeout(wait, read) => match read {
+            Ok(Ok(balance)) => Some(balance),
+            Ok(Err(e)) => {
+                tracing::warn!("the cycles balance could not be read: {e}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("the cycles balance was not read in time");
+                None
+            }
+        },
     }
 }
 
@@ -340,8 +387,9 @@ mod tests {
         }
     }
 
-    const LEDGER: &str = "Insufficient cycles. Requested: 2000000000000 cycles, available \
-                          balance: 5 cycles.";
+    /// The cycles ledger's refusal of a creation, as the icp library words it.
+    const LEDGER: &str = "failed to create canister: Insufficient cycles. Requested: \
+                          2000000000000 cycles, available balance: 5 cycles.";
 
     // An entry is an app URL and two phrases for the user: an https origin
     // as `open_app` takes one, with nothing after the host, and no two
@@ -374,20 +422,63 @@ mod tests {
         }
     }
 
-    // A deploy ran short when the ledger said so, wherever the library put
-    // its words: in the error, or in the log's line for the canister it
-    // could not create. Any other failure did not, and neither did a deploy
-    // that was stopped.
+    // A deploy ran short when the ledger refused a creation, wherever the
+    // library put its words: in the error, or in the log's line for the
+    // canister it could not create. Any other failure did not, and neither
+    // did a deploy that was stopped.
     #[test]
-    fn a_deploy_ran_short_when_the_ledger_said_so() {
+    fn a_deploy_ran_short_when_the_ledger_refused_a_creation() {
         let create = format!("  create frontend: failed: {LEDGER}");
-        assert!(ran_short(&outcome(Status::Failed, &format!("create failed: {LEDGER}"), &[])));
+        assert!(ran_short(&outcome(Status::Failed, &format!("deploy failed: {LEDGER}"), &[])));
         assert!(ran_short(&outcome(Status::Failed, "one canister failed", &[&create])));
         assert!(!ran_short(&outcome(Status::Failed, "install_code rejected", &["create: ok"])));
         assert!(!ran_short(&outcome(Status::Interrupted, "stopped", &[&create])));
         let mut deployed = outcome(Status::Deployed, "", &[&create]);
         deployed.error = None;
         assert!(!ran_short(&deployed));
+    }
+
+    // Cycles named by a failure that is not the ledger refusing a creation
+    // are not a balance to fund: a canister that ran out while its code was
+    // installed, a sync that could not pay, the ledger refusing a
+    // withdrawal. Nor is anything a purchase would not help: a deploy that
+    // has every canister it targeted.
+    #[test]
+    fn other_failures_that_mention_cycles_are_not_a_short_balance() {
+        for other in [
+            "install frontend: failed: Canister abc is out of cycles",
+            "sync frontend: failed: insufficient cycles to store the assets",
+            "Insufficient cycles for the call",
+            "Insufficient cycles. Requested: 5 cycles, balance: 1 cycles.",
+        ] {
+            assert!(!ran_short(&outcome(Status::Failed, other, &[])), "{other}");
+            assert!(!ran_short(&outcome(Status::Failed, "failed", &[other])), "{other}");
+        }
+        let mut all_created = outcome(Status::Failed, LEDGER, &[]);
+        for name in ["frontend", "worker"] {
+            all_created.canister_ids.insert(name.into(), Principal::management_canister());
+        }
+        assert_eq!(still_to_create(&all_created), 0);
+        assert!(!ran_short(&all_created), "nothing is left to create");
+    }
+
+    // The balance is waited for no longer than it is given, and not at all
+    // once the deploy has been told to stop: the answer goes without it.
+    #[tokio::test(start_paused = true)]
+    async fn the_balance_read_gives_way_to_a_stop_and_to_time() {
+        let wait = Duration::from_secs(10);
+        let stop = CancellationToken::new();
+        assert_eq!(balance_within(wait, &stop, async { Ok(7) }).await, Some(7));
+        assert_eq!(balance_within(wait, &stop, async { Err("down".into()) }).await, None);
+        let never = std::future::pending::<Result<u128, String>>;
+        assert_eq!(balance_within(wait, &stop, never()).await, None, "not past its time");
+
+        let (stopper, waiting) = (stop.clone(), balance_within(wait, &stop, never()));
+        let started = tokio::time::Instant::now();
+        let (read, ()) = tokio::join!(waiting, async move { stopper.cancel() });
+        assert_eq!(read, None);
+        assert!(started.elapsed() < wait, "a stop does not wait out the read");
+        assert_eq!(balance_within(wait, &stop, async { Ok(7) }).await, None, "stopped already");
     }
 
     // What is needed is each uncreated canister's cycles and the ledger's
@@ -444,6 +535,7 @@ mod tests {
         assert!(at("1. Write `canister_ids` back") < at("2. Tell the user"), "{text}");
         assert!(at("3. Call open_app") < at("payment URL"), "{text}");
         assert!(at("payment URL") < at("Then call icp_deploy again"), "{text}");
+        assert!(at("Then call icp_deploy again") < at("upload it again first"), "{text}");
         assert!(text.contains("on the provider's site"), "{text}");
 
         let unread = Funding::new(who, 1, 2_000_000_000_000, None).human();
@@ -459,6 +551,12 @@ mod tests {
         let steps = STEPS.join(" ");
         for tool in ["open_app", "get_canister_api_doc", "icp_deploy"] {
             assert!(steps.contains(tool), "{tool}");
+        }
+        // The retry is the deploy over again: what it was given, the mapping
+        // it returned, and a new upload where the bundle came by one.
+        let retry = STEPS.last().expect("steps");
+        for needle in ["same environment and settings", "mapping", "new upload id"] {
+            assert!(retry.contains(needle), "`{needle}` in: {retry}");
         }
         assert!(steps.contains("`principal`") && steps.contains("payment URL"));
         for provider in FUNDING_PROVIDERS {

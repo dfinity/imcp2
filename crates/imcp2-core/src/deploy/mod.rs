@@ -729,7 +729,7 @@ impl IcDeployTools {
     }
 
     #[tool(
-        description = "Deploy an ICP app to the Internet Computer. New canisters are created from the user's cycles balance; when it does not cover them the deploy fails and its answer says how to fund it (`funding`): the principal to credit, what is missing, where the user can buy cycles, and the steps, which end in one payment URL for the user to open. The steps of a deploy: (1) bundle the project in the user's environment with `icp project bundle --output <file>.tar.gz`; (2) upload that bundle via icp_deploy_upload; (3) save the `canister_ids` this tool returns, unchanged, into `.icp/data/mappings/<environment>.ids.json` file of the project. Skipping step 3 makes the next deploy create a new set of canisters instead of upgrading these. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created, so write it back then too. The resource `skill://deploy-with-mcp` has the full guide.",
+        description = "Deploy an ICP app to the Internet Computer. New canisters are created from the user's cycles balance, except on a cloud engine, where a canister is not paid for from it. When the balance does not cover them the deploy fails and its answer says how to fund it (`funding`): the principal to credit, what is missing, where the user can buy cycles, and the steps, which end in one payment URL for the user to open; buy only what a deploy's answer says is missing. The steps of a deploy: (1) bundle the project in the user's environment with `icp project bundle --output <file>.tar.gz`; (2) upload that bundle via icp_deploy_upload; (3) save the `canister_ids` this tool returns, unchanged, into `.icp/data/mappings/<environment>.ids.json` file of the project. Skipping step 3 makes the next deploy create a new set of canisters instead of upgrading these. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created, so write it back then too. The resource `skill://deploy-with-mcp` has the full guide.",
         annotations(title = "Deploy a project bundle", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<DeployBundleOutput>(),
     )]
@@ -914,7 +914,7 @@ impl IcDeployTools {
                 // The cycles ledger refused a creation: the answer says to
                 // whom cycles must be delivered and where they are sold.
                 if funding::ran_short(&outcome) {
-                    let funding = Funding::after(&outcome, principal, cycles);
+                    let funding = Funding::after(&outcome, principal, cycles, &stopped);
                     output.funding = Some(funding.instrument(span.clone()).await);
                 }
                 let text = output.human();
@@ -1331,6 +1331,11 @@ mod tests {
         // And the description says a short deploy answers with it.
         let said = tool.description.as_deref().expect("a description");
         for needle in ["cycles balance", "`funding`", "principal to credit", "payment URL"] {
+            assert!(said.contains(needle), "`{needle}` in: {said}");
+        }
+        // And that not every canister is paid for from the balance, so that
+        // nobody is sent to buy cycles a deploy has not asked for.
+        for needle in ["except on a cloud engine", "buy only what a deploy's answer says"] {
             assert!(said.contains(needle), "`{needle}` in: {said}");
         }
     }

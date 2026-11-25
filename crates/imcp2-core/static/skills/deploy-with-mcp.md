@@ -45,9 +45,12 @@ not know the canisters already exist and would create a second set.
 - Cycles. Each new canister is created from the user's cycles balance, 2T
   cycles unless `cycles` says otherwise. Before a deploy that will create canisters, tell the
   user how many and confirm; creation is not undone by a later failure.
+  A canister on a cloud engine is the exception: it is not paid for from
+  that balance, and a deploy to one needs no cycles bought.
   A deploy the balance does not cover fails and says how to fund it: see
   "When the cycles run short" below. `icp_deploy`'s description names where
-  cycles are sold, so you can tell a user who has none before you start.
+  cycles are sold, so you can tell a user who asks; have them buy only what a
+  deploy's `funding` says is missing.
 - An environment on the `ic` network (mainnet), which every manifest has.
   The tool deploys to the Internet Computer only: an environment on any other
   network — the default `local`, a testnet — is refused. Deploy those with
@@ -207,10 +210,13 @@ still missing.
 
 ### When the cycles run short
 
-A deploy whose error says `Insufficient cycles` ran out of the user's cycles
-balance: the canisters it had created are in the answer, the rest are not
-paid for. Its answer then carries `funding` (disregard the icp CLI commands
-the error itself suggests):
+A failed deploy whose answer carries `funding` ran out of the user's cycles
+balance: the cycles ledger refused to create a canister. The canisters it
+had created are in the answer, the rest are not paid for. Go by that field,
+not by the error's wording: a failure that mentions cycles and has no
+`funding` (a canister that ran out while its code was installed, say) is not
+one a purchase for this account fixes. Disregard the icp CLI commands the
+error itself suggests. `funding` holds:
 
 - `principal`: the principal `icp_deploy` creates canisters as. Its Cycles
   Ledger account holds the balance, and is the account bought cycles must be
@@ -247,8 +253,9 @@ What to do:
    card details and never enter any: they go to that page alone.
 6. Read the order's status as the guide says until the cycles are delivered
    (the guide names the statuses on the way, and what a refund looks like).
-7. Deploy again with the updated mapping. On a server that takes the bundle
-   by upload, upload it again first: an upload is spent by one deploy.
+7. Deploy again with the same environment and settings and the updated
+   mapping. On a server that takes the bundle by upload, upload it again
+   first and pass the new upload id: an upload is spent by one deploy.
 
 If `open_app` marks none of a provider's canisters `[declared]`, the provider
 is not reachable through this server and no order can be made here: offer

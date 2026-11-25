@@ -90,14 +90,16 @@ impl<H: ServerHandler> WithDeploy<H> {
         format!(
             "DEPLOYING. `icp_deploy` deploys an icp project bundle (`icp project bundle \
              --output <file>`, built in the user's environment) to the Internet Computer, \
-             creating new canisters from the user's cycles balance and upgrading those named in `canister_ids`. {bundle} It needs an \"Actions & \
+             creating new canisters from the user's cycles balance (a cloud engine's are not \
+             paid for from it) and upgrading those named in `canister_ids`. {bundle} It needs an \"Actions & \
              questions\" session and lasts as long as the deploy; send a progressToken to see \
              each phase. It returns `canister_ids`, the app's development metadata: write it \
              unchanged to the project's `.icp/data/mappings/<environment>.ids.json` and pass \
              that file's content back on the next deploy, or the next deploy creates new \
              canisters. A deploy the cycles balance does not cover fails with `funding` in \
-             its answer: whom to credit, what is missing and where the user can buy cycles. \
-             They pay on the provider's own page, never here. The resource \
+             its answer: whom to credit, what is missing and where the user can buy cycles, \
+             which is the time to buy. They pay on the provider's own page, never here. The \
+             resource \
              `skill://deploy-with-mcp` has the full steps."
         )
     }
