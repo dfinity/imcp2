@@ -705,8 +705,8 @@ fn failed_with(ended: &str) -> String {
 
 /// Where the user can buy cycles by card for a principal: CyclePay credits
 /// them to the principal's cycles-ledger account, which is what canister
-/// creation spends. The principal is appended, then the amount (see
-/// [`cyclepay_url`]).
+/// creation spends. The principal is appended, then the amount and the tag
+/// of a tool's link (see [`cyclepay_url`]).
 pub const CYCLEPAY_URL: &str = "https://www.cyclepay.org/?dest=ledger&to=";
 
 /// The funds a deploy short of cycles asks for, in whole US dollars for each
@@ -724,9 +724,11 @@ pub const CYCLEPAY_MIN_USD: u64 = 5;
 const CYCLEPAY_MAX_USD: u64 = 200;
 
 /// The CyclePay page that funds `deploy_principal` with `usd` dollars
-/// preselected.
+/// preselected. `from=icp-cli` is the tag CyclePay reads for a tool's link:
+/// it opens the short checkout, the account and the amount on one screen
+/// with the button that goes on to Stripe.
 fn cyclepay_url(deploy_principal: Principal, usd: u64) -> String {
-    format!("{CYCLEPAY_URL}{deploy_principal}&usd={usd}")
+    format!("{CYCLEPAY_URL}{deploy_principal}&usd={usd}&from=icp-cli")
 }
 
 /// How many of a deploy's canisters the mapping it returns has no id for:
@@ -1952,7 +1954,7 @@ mod tests {
             "{said}"
         );
         assert!(
-            said.contains("https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae&usd=8 "),
+            said.contains("https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae&usd=8&from=icp-cli "),
             "{said}"
         );
         assert!(said.contains("You can fund it with CyclePay at"), "{said}");
@@ -1973,19 +1975,19 @@ mod tests {
         for to_create in [0, 1] {
             let said = said(to_create);
             assert!(said.contains("$5 for the 1 canister still to be created"), "{said}");
-            assert!(said.contains("to=2vxsx-fae&usd=5 "), "{said}");
+            assert!(said.contains("to=2vxsx-fae&usd=5&from=icp-cli "), "{said}");
             assert!(!said.contains("One payment is"), "{said}");
         }
         // The most one payment takes is asked for whole, in one link.
         let said_50 = said(50);
         assert!(said_50.contains("$200 for the 50 canisters still to be created"), "{said_50}");
-        assert!(said_50.contains("to=2vxsx-fae&usd=200 "), "{said_50}");
+        assert!(said_50.contains("to=2vxsx-fae&usd=200&from=icp-cli "), "{said_50}");
         assert!(!said_50.contains("One payment is"), "{said_50}");
         // Past it the estimate is whole, the link is for one payment's most,
         // and the user is told the rest takes more.
         let said_70 = said(70);
         assert!(said_70.contains("$280 for the 70 canisters still to be created"), "{said_70}");
-        assert!(said_70.contains("to=2vxsx-fae&usd=200 "), "{said_70}");
+        assert!(said_70.contains("to=2vxsx-fae&usd=200&from=icp-cli "), "{said_70}");
         assert!(
             said_70.contains(
                 "deploying. One payment is $200 at the most, which is what the link is for; the \
