@@ -529,7 +529,7 @@ pub async fn deploy_bundle(
             let ended = error_chain(&e);
             outcome.error = Some(match (is_insufficient_cycles(&e), deploy_principal) {
                 (true, Some(deploy_principal)) => {
-                    insufficient_cycles(deploy_principal, params.cycles, &ended)
+                    insufficient_cycles(deploy_principal, params.cycles)
                 }
                 _ => failed_with(&ended),
             });
@@ -712,10 +712,8 @@ fn is_insufficient_cycles(error: &DeployError) -> bool {
 /// What a deploy that ran out of cycles says, for the agent to relay: the
 /// principal to fund — the deploy identity's, which is not the one
 /// `icp_cycles_balance` reports — where to buy cycles for it, and what to do
-/// next. The library's own text, whose advice is the CLI's, follows as the
-/// details.
-fn insufficient_cycles(deploy_principal: Principal, cycles: u128, ended: &str) -> String {
-    let details = ended.split_whitespace().collect::<Vec<_>>().join(" ");
+/// next. The library's own text is left out: its advice is the CLI's.
+fn insufficient_cycles(deploy_principal: Principal, cycles: u128) -> String {
     format!(
         "NOT ENOUGH CYCLES: the deploy could not create canister(s) because your Internet Identity \
          does not have enough cycles. Each new \
@@ -726,8 +724,7 @@ fn insufficient_cycles(deploy_principal: Principal, cycles: u128, ended: &str) -
          through and I'll retry deploying.\" Do not retry until the user confirms they are done funding. \
          Then retry deploying with the same bundle and with the `canister_ids` returned here \
          (write them back to the project first): any canister already created is listed there \
-         and will not be created again. \
-         Details: {details}"
+         and will not be created again."
     )
 }
 
@@ -1890,24 +1887,11 @@ mod tests {
     #[test]
     fn running_out_of_cycles_names_the_principal_and_where_to_pay() {
         let deploy_principal = Principal::from_text("2vxsx-fae").unwrap();
-        let said = insufficient_cycles(
-            deploy_principal,
-            2_000_000_000_000,
-            &error_chain(&insufficient_funds()),
-        );
+        let said = insufficient_cycles(deploy_principal, 2_000_000_000_000);
         assert!(said.starts_with("NOT ENOUGH CYCLES: "), "{said}");
-        assert!(said.contains("principal 2vxsx-fae"), "{said}");
         assert!(said.contains("https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae "), "{said}");
-        assert!(said.contains("`icp_cycles_balance`"), "{said}");
-        // The library's text is kept, on one line.
-        assert!(
-            said.contains(
-                "Details: failed to create canister: Insufficient cycles. Requested: \
-                 2000000000000 cycles, available balance: 150_000_000_000 cycles. use `icp cycles \
-                 mint`"
-            ),
-            "{said}"
-        );
+        // The library's text, whose advice is the CLI's, is not passed on.
+        assert!(!said.contains("Details") && !said.contains("icp cycles mint"), "{said}");
         assert!(!said.contains('\n') && !said.contains("  "), "{said}");
     }
 
