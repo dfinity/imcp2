@@ -1,6 +1,6 @@
 ---
 name: deploy-with-mcp
-description: "Deploy an icp project to the Internet Computer through this MCP server's icp_deploy tool instead of running icp deploy yourself. Covers the three steps an agent performs: bundle the project with icp project bundle, call icp_deploy with the bundle and the environment's canister ids file, and write the canister ids the tool returns back to that file; and what to do when the deploy says the user's cycles do not cover it: where they can buy more, and to whom. Use when the user asks you to deploy, ship, publish, upgrade or redeploy an icp project, asks what icp_deploy needs, or needs cycles to deploy with. Do NOT use for projects targeting a local network (run icp deploy there) or for building the project (see the icp-cli skill)."
+description: "Deploy an icp project to the Internet Computer through this MCP server's icp_deploy tool instead of running icp deploy yourself. Covers the three steps an agent performs: bundle the project with icp project bundle, call icp_deploy with the bundle and the environment's canister ids file, and write the canister ids the tool returns back to that file; and what to do when the deploy says the user's cycles do not cover it: which funding providers there are, and which account must receive the cycles. Use when the user asks you to deploy, ship, publish, upgrade or redeploy an icp project, asks what icp_deploy needs, or needs cycles to deploy with. Do NOT use for projects targeting a local network (run icp deploy there) or for building the project (see the icp-cli skill)."
 license: Apache-2.0
 metadata:
   title: Deploy with this MCP server
@@ -45,12 +45,12 @@ not know the canisters already exist and would create a second set.
 - Cycles. Each new canister is created from the user's cycles balance, 2T
   cycles unless `cycles` says otherwise. Before a deploy that will create canisters, tell the
   user how many and confirm; creation is not undone by a later failure.
-  A canister on a cloud engine is the exception: it is not paid for from
-  that balance, and a deploy to one needs no cycles bought.
+  A canister on a cloud engine is the exception: it does not draw on that
+  balance, and a deploy to one needs no cycles added.
   A deploy the balance does not cover fails and says how to fund it: see
-  "When the cycles run short" below. `icp_deploy`'s description names where
-  cycles are sold, so you can tell a user who asks; have them buy only what a
-  deploy's `funding` says is missing.
+  "When the cycles run short" below. `icp_deploy`'s description names the
+  funding providers, so you can tell a user who asks; have them add cycles
+  only once a deploy's `funding` says they are missing.
 - An environment on the `ic` network (mainnet), which every manifest has.
   The tool deploys to the Internet Computer only: an environment on any other
   network — the default `local`, a testnet — is refused. Deploy those with
@@ -212,59 +212,60 @@ still missing.
 
 A failed deploy whose answer carries `funding` ran out of the user's cycles
 balance: the cycles ledger refused to create a canister. The canisters it
-had created are in the answer, the rest are not paid for. Go by that field,
+had created are in the answer; the rest were not created. Go by that field,
 not by the error's wording: a failure that mentions cycles and has no
 `funding` (a canister that ran out while its code was installed, say) is not
-one a purchase for this account fixes. Disregard the icp CLI commands the
-error itself suggests. `funding` holds:
+one that adding cycles to this account fixes. Disregard the icp CLI commands
+the error itself suggests. `funding` holds:
 
 - `principal`: the principal `icp_deploy` creates canisters as. Its Cycles
-  Ledger account holds the balance, and is the account bought cycles must be
+  Ledger account holds the balance, and is the account added cycles must be
   delivered to. It is not the user's principal in any app, the provider's
   included.
 - `needed`, and when the ledger answered, `balance` and `shortfall`, in
   cycles: what the canisters still to create take, what is there, and what
-  is missing at the least.
-- `providers`: where the user can buy cycles, each with a name, an `app_url`
-  and how the user pays there.
-- `steps`: what to do with a provider, the same for all of them.
+  is missing at the least. A `shortfall` of `0` means cycles arrived in the
+  meantime: add nothing, do steps 1 and 7 below.
+- `providers`: the funding providers, each with a name, an `app_url` and how
+  the user completes the checkout there.
+- `steps`: what to do next, the same for every provider.
 
 What to do:
 
 1. Do step 3 first, with the `canister_ids` of this answer.
-2. Tell the user what is missing, show them the providers, and let them
-   pick one and how much to buy. Do not pick for them, and do not round the
+2. Tell the user what is missing, show them the funding providers, and let
+   them pick one and how many cycles to add: at least the shortfall, and a
+   provider may have a minimum. Do not pick for them, and do not round the
    amount up without saying so.
 3. Call `open_app` with the provider's `app_url`, then
-   `get_canister_api_doc` on the canister it marks `[declared]` for orders.
-   That guide is the provider's own. It says how to quote a price (what the
-   amount buys after the provider's fees, at the current rate) and how to
-   make an order; this skill does not, because each provider differs and
-   changes its terms without notice here.
-4. Following the guide, make an order whose cycles go to the Cycles Ledger
-   account of `principal`. Name that principal as the account to credit (a
-   beneficiary or recipient argument): the order is made as the user's
-   account at the provider, which is another principal, and an order that
-   credits the caller sends the cycles where `icp_deploy` cannot spend them.
-   The order call is a `canister_update_call` and needs an "Actions &
-   questions" session. It takes no payment: it answers a payment URL.
-5. Give the user the payment URL exactly as the provider returned it. They
-   open it and confirm one payment on the provider's page. Never ask for
+   `get_canister_api_doc` on the canister it marks `[declared]`. That guide
+   is the provider's own. It says what an amount covers at the current rate
+   and how to make a funding request; this skill does not, because each
+   provider differs and changes its terms without notice here.
+4. Following the guide, make a funding request whose cycles go to the Cycles
+   Ledger account of `principal`. Name that principal as the recipient (the
+   guide says which argument that is): the request is made as the user's
+   account at the provider, which is another principal, and a request that
+   delivers to its caller puts the cycles where `icp_deploy` cannot use
+   them. The request is a `canister_update_call` and needs an "Actions &
+   questions" session. It charges nothing: it answers a checkout URL.
+5. Give the user the checkout URL exactly as the provider returned it. They
+   open it and complete the checkout on the provider's page. Never ask for
    card details and never enter any: they go to that page alone.
-6. Read the order's status as the guide says until the cycles are delivered
-   (the guide names the statuses on the way, and what a refund looks like).
+6. Read the request's status as the guide says until the cycles are
+   delivered (the guide names the statuses on the way).
 7. Deploy again with the same environment and settings and the updated
    mapping. On a server that takes the bundle by upload, upload it again
-   first and pass the new upload id: an upload is spent by one deploy.
+   first and pass the new upload id: an upload is used up by one deploy.
 
 If `open_app` marks none of a provider's canisters `[declared]`, the provider
-is not reachable through this server and no order can be made here: offer
-another, or tell the user they can buy on the provider's own site, entering
-`principal` as the Cycles Ledger account to credit.
+is not reachable through this server and no request can be made here: offer
+another, or tell the user they can add cycles on the provider's own site,
+entering `principal` as the Cycles Ledger account to receive them.
 
-Nothing here moves money. The server names an account and a list; the order
-records what the user is about to pay for; the payment is the user's own, on
-a page of the provider's.
+Nothing here handles a checkout. The server names an account and a list; the
+request records what the user is about to confirm; the checkout is the
+user's own, on a page of the provider's.
 
 ## Step 3: Update the project's mapping file
 
@@ -306,11 +307,11 @@ created and their ids.
    second is refused, not queued. Wait for the answer, do step 3, then deploy
    again from the updated file. A server that answers that it is busy is
    deploying for others: try again in a few minutes.
-8. **Sending bought cycles to the wrong account.** The balance
-   `icp_deploy` spends is that of the `principal` in its `funding` answer.
-   An order that credits its caller, or the principal the user has in the
-   provider's app, delivers cycles the deploy cannot use. Name `principal`
-   as the account to credit, every time.
+8. **Sending added cycles to the wrong account.** The balance `icp_deploy`
+   draws on is that of the `principal` in its `funding` answer. A funding
+   request that delivers to its caller, or to the principal the user has in
+   the provider's app, delivers cycles the deploy cannot use. Name
+   `principal` as the recipient, every time.
 9. **A call that never returned.** Cancelling the call, or losing the
    connection, interrupts the deploy at its next step; a canister call
    already in flight is waited for and what it did is recorded, so a

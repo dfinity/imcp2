@@ -186,14 +186,14 @@ add their principal as a controller. The session must have been granted
 "Actions & questions" at sign-in.
 
 A deploy your cycles balance does not cover fails and says how to fund it:
-the principal whose Cycles Ledger account to credit, what the canisters
-still to create need, and where you can buy cycles (CyclePay, by card, to
-begin with; the tool's description names the same places up front). The
-server takes no payment: the agent makes an order with the provider you
-pick, through the provider's own published interface, and hands you the
-payment URL it answers; you confirm one payment on the provider's page, and
-the cycles arrive on the account the next deploy spends from. The repository
-README's "Funding a deploy" has the details.
+the principal whose Cycles Ledger account must receive cycles, what the
+canisters still to create need, and the funding providers (CyclePay, by
+card, to begin with; the tool's description names the same ones up front).
+The server handles no checkout: the agent makes a funding request with the
+provider you pick, through the provider's own published interface, and
+hands you the checkout URL it answers; you complete the checkout on the
+provider's page, and the cycles arrive on the account the next deploy draws
+on. The repository README's "Funding a deploy" has the details.
 
 One deploy runs at a time: a second call while one is running is refused
 rather than queued, since the mapping it carries would be stale by the time

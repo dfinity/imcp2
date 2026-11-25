@@ -34,10 +34,10 @@ one of the financial-service canisters it carries. An update call needs the
 canister's published interface: a canister that publishes none, or whose
 interface cannot be read, receives no update call through this server, so
 every update the server sends was checked against the canister's own
-interface. The connector takes no payment and transfers no cycles:
-`icp_deploy` creates canisters from cycles the user already holds, and when
-those run short it only says what is missing and where cycles are sold. The
-user buys them on the provider's own page (see
+interface. The connector handles no checkout and moves no cycles between
+accounts: `icp_deploy` creates canisters from cycles the user already holds,
+and when those run short it only says what is missing and which funding
+providers there are. The user adds cycles on the provider's own page (see
 [Funding a deploy](#funding-a-deploy)), or with the
 [`icp` CLI](https://github.com/dfinity/icp-cli) in their own terminal, which
 is also where a canister is topped up.
@@ -763,71 +763,70 @@ drain does not cover when a deploy's client has already gone.
 `icp_deploy` creates canisters from the cycles-ledger balance of the
 principal it signs as, 2T cycles each unless the call says otherwise. A user
 deploying for the first time usually has none. No tool was added for that:
-the deploy tool itself says where cycles come from, twice.
+the deploy tool itself says how canisters are funded, twice.
 
-- **Its description names where cycles are sold**, so an agent can tell the
+- **Its description names the funding providers**, so an agent can tell the
   user before it deploys. The sentence is made from the list below.
 - **A deploy the balance did not cover answers with `funding`**, beside the
   mapping of what it did create:
 
   | Field | What it is |
   |---|---|
-  | `principal` | The principal `icp_deploy` creates canisters as (the user's default account at `https://cli.id.ai`). Its Cycles Ledger account holds the balance and is the account an order must credit. |
-  | `needed` | What creating the canisters still missing takes: each one's cycles plus the ledger's fee. |
-  | `balance`, `shortfall` | The balance after the deploy and what of `needed` it does not cover. Absent if the ledger did not answer within ten seconds. |
-  | `providers` | Where the user can buy cycles: `name`, `app_url`, `pays_with`. |
-  | `steps` | What an agent does with a provider, the same for every one. |
+  | `principal` | The principal `icp_deploy` creates canisters as (the user's default account at `https://cli.id.ai`). Its Cycles Ledger account holds the balance and is the account added cycles must be delivered to. |
+  | `needed` | What creating the canisters still missing takes: each one's cycles plus what the ledger takes for creating it. |
+  | `balance`, `shortfall` | The balance after the deploy and what of `needed` it does not cover. Absent if the ledger did not answer within ten seconds, or the server was told to stop. A `shortfall` of `0` means cycles arrived in the meantime: the steps then only say to deploy again. |
+  | `providers` | The funding providers: `name`, `app_url`, `checkout`. |
+  | `steps` | What an agent does next, the same for every provider. |
 
 `funding` is attached when the cycles ledger itself refused a creation and
 a canister is still to create, never on a balance checked beforehand: a
-canister on a cloud engine is not paid for from the ledger, so a check ahead
-of the deploy would refuse deploys that were going to succeed. The refusal
-is known by the icp library's wording of it, which is all the library hands
-on; a failure that merely mentions cycles (an install on a canister that ran
-out, say) carries no `funding`. The balance read gives way to a stop, so a
-server that is stopping does not wait on it. The cost is that a
-user with no cycles learns it from a failed deploy, and on the hosted
-server uploads the bundle a second time after paying.
+canister on a cloud engine does not draw on the ledger, so a check ahead of
+the deploy would refuse deploys that were going to succeed. The refusal is
+known by the icp library's wording of it, which is all the library hands on
+(a test takes that wording from the library's own types, so a release that
+changes it fails there); a failure that merely mentions cycles (an install
+on a canister that ran out, say) carries no `funding`. The cost is that a
+user with no cycles learns it from a failed deploy, and on the hosted server
+uploads the bundle a second time after adding them.
 
-The server knows no payment provider. It keeps a list of apps
+The server knows no provider. It keeps a list of apps
 (`imcp2_core::deploy::FUNDING_PROVIDERS`), each a name, a URL and a phrase
-on how the user pays there:
+on how the user completes the checkout there:
 
-| Provider | App URL | Pays with |
+| Provider | App URL | Checkout |
 |---|---|---|
-| CyclePay | `https://www.cyclepay.org` | card, on Stripe's checkout page |
+| CyclePay | `https://www.cyclepay.org` | by card, on Stripe's checkout page |
 
 Everything else comes from the provider, through the
 [service-discoverability](https://docs.internetcomputer.org/guides/frontends/service-discoverability/)
 layers the tools above already read: `open_app` on the provider's URL finds
 the canister its manifest declares, `get_canister_api_doc` returns the
-provider's own guide to quoting and ordering, and the order is an ordinary
-`canister_update_call`. Whichever provider the user picks, the flow ends the
-same way: the order call takes no payment and answers **one payment URL**;
-the user opens it and confirms a single payment on the provider's page; the
-cycles arrive on `principal`'s Cycles Ledger account; the next `icp_deploy`
-spends them. For CyclePay that is `create_order` with a `Ledger` destination
-and `principal` as `beneficiary`, answering a Stripe link, and none of it is
-written into the server: the agent reads it from CyclePay's API doc at the
-time of the order.
+provider's own guide to making a funding request, and the request is an
+ordinary `canister_update_call`. Whichever provider the user picks, the flow
+ends the same way: the request charges nothing and answers **one checkout
+URL**; the user opens it and completes the checkout on the provider's page;
+the cycles arrive on `principal`'s Cycles Ledger account; the next
+`icp_deploy` uses them. For CyclePay that is a request naming a Cycles
+Ledger destination and `principal` as its recipient, answering a link to
+Stripe's page, and none of it is written into the server: the agent reads it
+from CyclePay's API doc at the time of the request.
 
-What this buys:
+What this gives:
 
 - **Another provider is one entry in the list.** No adapter, no method name,
-  no fee table to keep in step with someone else's canister.
+  no rate table to keep in step with someone else's canister.
 - **A provider's manifest is its switch.** The manifest gates every call to
-  its canisters, so a provider that takes it down can no longer be ordered
-  from through this server, with no release here.
-- **The financial guard is unchanged, and it vouches for no provider.** The
-  order goes through `canister_update_call` and its three checks like any
-  other call, with no exemption, and has to pass them to be made here at
-  all: a name with no financial keyword, on a canister with no ICRC-1 or
-  ICRC-2 method. That is not evidence that an order is harmless. The guard
-  cannot tell a bespoke value-moving method under an ordinary name (one that
-  spends an allowance the user gave elsewhere, for instance), as its own
-  description says. So that a provider's order takes no payment and moves no
-  assets is checked when its entry is reviewed, from what the method does,
-  independently of the guard. No payment detail reaches the server or the
+  its canisters, so a provider that takes it down can no longer be reached
+  through this server, with no release here.
+- **The guard on `canister_update_call` is unchanged, and it vouches for no
+  provider.** The request goes through its three checks like any other
+  call, with no exemption, and has to pass them to be made here at all. That
+  is not evidence that a request is harmless. The guard cannot tell a
+  bespoke value-moving method under an ordinary name (one that acts on an
+  approval the user gave elsewhere, for instance), as its own description
+  says. So that a provider's request charges nothing and moves no assets is
+  checked when its entry is reviewed, from what the method does,
+  independently of the guard. No card detail reaches the server or the
   agent.
 
 [`docs/scoping-cycles-funding.md`](docs/scoping-cycles-funding.md) has the

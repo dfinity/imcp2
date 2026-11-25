@@ -486,10 +486,10 @@ mod tests {
             assert!(tools.iter().any(|t| &*t.name == expected), "missing {expected}");
         }
         // The deploy tool is where funding is advertised: its description
-        // names where cycles are sold.
+        // names the funding providers.
         let deploy = tools.iter().find(|t| &*t.name == "icp_deploy").expect("icp_deploy");
         let said = deploy.description.as_deref().unwrap_or_default();
-        assert!(said.contains("Cycles are sold at: CyclePay (https://www.cyclepay.org)"), "{said}");
+        assert!(said.contains("Funding providers: CyclePay (https://www.cyclepay.org)"), "{said}");
 
         let call = |name: &'static str, args: Option<serde_json::Value>| {
             let client = &client;
