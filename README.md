@@ -651,7 +651,7 @@ What the hosted composition adds to the local one:
   while it is sent would otherwise have no record of the canisters it paid
   for.
 - **Bounds.** One deploy per session and `$MCP_DEPLOY_MAX_CONCURRENT` across
-  sessions and endpoints (the slots are the process's, shared by `/mcp` and
+  sessions and endpoints (the slots are the server's, shared by `/mcp` and
   `/mcp-beta`), refused past the cap rather than queued. Each deploy's
   directory is made under `{state_dir}/deploys`, readable by the server's user
   alone, and removed when the deploy returns unless it is kept as a record
@@ -674,8 +674,13 @@ What the hosted composition adds to the local one:
   start to finish. Unset, each is the icp CLI's own default — 4 GiB, 60
   seconds, and no limit on the whole run — which stops nothing a plugin does
   today; a plugin runs for each deploy at once, so the memory limit times
-  `$MCP_DEPLOY_MAX_CONCURRENT` is what plugins can take together. A zero, or
-  a value that is not a whole number, stops the server from starting.
+  `$MCP_DEPLOY_MAX_CONCURRENT` is the linear memory plugins can take
+  together. That is not all a run takes: compiling the plugin, its tables
+  and the host's buffers are the runtime's own allocations, outside the
+  limit, so leave headroom over it. A zero, a value that is not a whole
+  number, or one that is not valid UTF-8 stops the server from starting; a
+  blank one (`NAME=`) is read as unset, as for every `$MCP_DEPLOY_*`
+  variable.
   And this server runs the plugin releases it knows and
   no others, each known by the sha256 of its module (which is what `icp
   project bundle` records for it), never by the name or path the bundle
@@ -733,11 +738,15 @@ one-time ticket.
 Nothing here is read from the environment by the library: the `$MCP_DEPLOY_*` variables above are the bundled binary's, which
 maps them onto `imcp2::deploy::DeployConfig`, and an embedder sets that
 struct's fields from its own configuration, at `McpConfig::deploy`. The
-server makes the process's deploy state under its state directory as it is
+server makes its deploy state under its state directory as it is
 built, and a second instance on the same origin is made from the first
-(`McpServer::sibling`), not built again: the caps are the process's, and a
-second server over a directory in use would clear the uploads and deploys of
-the first, so `McpServer::new` refuses one. Nothing
+(`McpServer::sibling`), not built again: the caps hold per
+`McpServer::new` — per state directory — and are shared by its siblings,
+and a second server over a directory in use would clear the uploads and
+deploys of the first, so `McpServer::new` refuses one. Servers built by
+separate `McpServer::new` calls (another origin, over another state
+directory) each have caps of their own, so a process that runs several
+sizes them together. Nothing
 more is needed to run it — `spawn_session_reaper` starts the deploy sweeper
 and `shutdown` stops the running deploys — but an embedder that drains
 in-flight requests calls `Deploys::stop` (on `McpServer::deploys`) *before* the drain, as the bundled

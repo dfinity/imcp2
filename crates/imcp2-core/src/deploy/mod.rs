@@ -576,6 +576,20 @@ impl IcDeployTools {
         self
     }
 
+    /// What each sync plugin a deploy runs is held to
+    /// ([`Self::with_plugin_limits`]).
+    pub fn plugin_limits(&self) -> PluginLimits {
+        self.plugin_limits
+    }
+
+    /// Set on `request` what the server decides for every deploy, whatever
+    /// the call asked: what each sync plugin is held to, and where the
+    /// deploy's working directory is made.
+    fn apply_settings(&self, request: &mut DeployRequest) {
+        request.plugin_limits = self.plugin_limits;
+        request.workdir = self.deploys_dir.clone();
+    }
+
     /// Tell `observer` how each deploy call goes — refused, or how it ended
     /// and how long it held its slot — for a server to count (see
     /// [`DeployObserver`]).
@@ -818,8 +832,7 @@ impl IcDeployTools {
         let mut request = into_request(source);
         request.limits = limits;
         request.plugins = plugins;
-        request.plugin_limits = self.plugin_limits;
-        request.workdir = self.deploys_dir.clone();
+        self.apply_settings(&mut request);
         // A per-app delegation lives five minutes and a deploy can outlast
         // it (an asset sync, several installs), so the identity the agent
         // signs with is kept fresh for as long as the deploy runs.
@@ -1184,6 +1197,27 @@ mod tests {
     }
     fn by_upload(json: serde_json::Value) -> Result<DeployRequest, String> {
         request_from_args(args(json), true).map(|(b, into)| into(BundleSource::Path(b.into())))
+    }
+
+    /// The plugin limits a server sets are what every deploy it runs is
+    /// held to, not the icp CLI's defaults the request starts from.
+    #[test]
+    fn a_deploy_is_held_to_the_servers_plugin_limits() {
+        let limits = PluginLimits {
+            memory_bytes: Some(256 << 20),
+            compute_secs: Some(7),
+            wall_clock: Some(std::time::Duration::from_secs(90)),
+        };
+        let tools = tools().with_plugin_limits(limits);
+        assert_eq!(tools.plugin_limits(), limits);
+        let mut request = by_path(serde_json::json!({
+            "bundle_path": "/tmp/app.tar.gz",
+            "environment": "ic",
+        }))
+        .unwrap();
+        assert_eq!(request.plugin_limits, PluginLimits::default());
+        tools.apply_settings(&mut request);
+        assert_eq!(request.plugin_limits, limits);
     }
 
     // The skill is in the registry's SKILL.md shape (frontmatter naming it as

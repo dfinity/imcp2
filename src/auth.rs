@@ -343,26 +343,45 @@ struct ClientStore {
     /// Set while a persist task is running, so concurrent registrations only
     /// mark the store dirty instead of each spawning their own writer.
     writing: AtomicBool,
+    /// The lock on the state directory's deploy directory, held for as long
+    /// as this store is — and so by its writer ([`Self::persist_soon`]),
+    /// which outlives every server handle while a write is pending: a second
+    /// server finding the lock free could otherwise load the file, only to
+    /// have this store's last pass overwrite what it registered, or race it
+    /// on the `.tmp` file. `None` for a store tests make ([`Self::with`]).
+    _owned: Option<Arc<std::fs::File>>,
 }
 
 impl ClientStore {
     /// Load the persisted registrations from `state_dir/{CLIENTS_FILENAME}`,
-    /// binding the store to `state_dir` for later write-throughs.
-    fn load(state_dir: PathBuf) -> Arc<Self> {
+    /// binding the store to `state_dir` for later write-throughs, and
+    /// holding `owned` — the state directory's lock — for as long as the
+    /// store lives.
+    fn load(state_dir: PathBuf, owned: Arc<std::fs::File>) -> Arc<Self> {
         let registrations = load_clients_from(&state_dir.join(CLIENTS_FILENAME));
-        Self::with(registrations, state_dir)
+        Self::new(registrations, state_dir, Some(owned))
     }
 
     /// A store over `registrations` as given, bound to `state_dir` for
     /// write-throughs (the seam tests use to start from a known set without
     /// reading the deployment's file — pass a throwaway dir when persistence is
     /// irrelevant).
+    #[cfg(test)]
     fn with(registrations: HashMap<String, ClientReg>, state_dir: PathBuf) -> Arc<Self> {
+        Self::new(registrations, state_dir, None)
+    }
+
+    fn new(
+        registrations: HashMap<String, ClientReg>,
+        state_dir: PathBuf,
+        owned: Option<Arc<std::fs::File>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             registrations: RwLock::new(registrations),
             state_dir,
             dirty: AtomicBool::new(false),
             writing: AtomicBool::new(false),
+            _owned: owned,
         })
     }
 
@@ -1649,8 +1668,13 @@ impl SharedClients {
     /// [`sibling`](crate::McpServer::sibling) shares it, so a registration made
     /// against either instance's AS is known to both and the persisted snapshot
     /// never loses the other's entries.
-    pub fn load(state_dir: impl AsRef<Path>) -> Self {
-        Self(ClientStore::load(state_dir.as_ref().to_path_buf()))
+    ///
+    /// `owned` is the lock on `state_dir` the server holds
+    /// ([`crate::deploy::Deploys`]): the store keeps it until it and the
+    /// writer of its last pending registrations are gone, so no second
+    /// server takes the directory while this one can still write to it.
+    pub fn load(state_dir: impl AsRef<Path>, owned: Arc<std::fs::File>) -> Self {
+        Self(ClientStore::load(state_dir.as_ref().to_path_buf(), owned))
     }
 }
 
@@ -6315,5 +6339,129 @@ mod tests {
         )
         .await;
         assert_eq!(redeem.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+}
+
+/// The client store as a server holds it: shared by its siblings, and
+/// writing under the state directory's lock.
+#[cfg(test)]
+mod server_tests {
+    use std::time::Duration;
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use super::ClientReg;
+    use crate::{Agent, IiInstance, McpConfig, McpServer, IC_URL};
+
+    fn config(state_dir: &std::path::Path) -> McpConfig {
+        McpConfig {
+            agent: Agent::builder().with_url(IC_URL).build().expect("agent"),
+            instance: IiInstance::prod().expect("prod instance"),
+            public_url: "https://mcp.example.com".into(),
+            mcp_path: "/mcp".into(),
+            state_dir: state_dir.to_path_buf(),
+            require_resource: true,
+            cimd_enabled: false,
+            deploy: Default::default(),
+        }
+    }
+
+    /// A registration's write outlives the server it was made at — the
+    /// writer waits out its interval before it ends — and the directory
+    /// stays that server's until it has: a second server built over it in
+    /// the meantime is refused, rather than loading the file only for the
+    /// first one's last pass to overwrite what it registers.
+    #[tokio::test]
+    async fn a_pending_registration_write_keeps_the_directory_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = McpServer::new(config(dir.path())).unwrap();
+        let reg = ClientReg::new(vec!["http://127.0.0.1:1/cb".into()]);
+        old.store.clients.register("old-client".into(), reg).await;
+        drop(old);
+
+        let Err(refused) = McpServer::new(config(dir.path())) else {
+            panic!("a second server took the directory while the first could still write to it");
+        };
+        assert_eq!(refused.kind(), std::io::ErrorKind::ResourceBusy, "{refused}");
+
+        // Once the writer has finished, the directory is free, and the
+        // registration it wrote is there for the next server.
+        let deadline = tokio::time::Instant::now() + 4 * super::PERSIST_MIN_INTERVAL;
+        let new = loop {
+            match McpServer::new(config(dir.path())) {
+                Ok(server) => break server,
+                Err(e) if tokio::time::Instant::now() < deadline => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::ResourceBusy, "{e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("the directory is still held after the write: {e}"),
+            }
+        };
+        assert!(new.store.clients.registrations.read().await.contains_key("old-client"));
+    }
+
+    /// Register a client at `router` (an instance's MCP router), with a
+    /// loopback redirect, and return its `client_id`.
+    async fn register_at(router: Router) -> String {
+        let resp = router
+            .oneshot(
+                Request::post("/oauth/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"redirect_uris":["http://127.0.0.1:4321/cb"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        doc["client_id"].as_str().expect("a client_id").to_string()
+    }
+
+    /// The status of a `ping` sent to `router` with `token`.
+    async fn ping(router: Router, token: &str) -> StatusCode {
+        let resp = router
+            .oneshot(
+                Request::post("/")
+                    .header("host", "mcp.example.com")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.status()
+    }
+
+    /// Siblings share client registrations and nothing else of the OAuth
+    /// state: a client registered through either is known to both, and a
+    /// token one issued is good there alone.
+    #[tokio::test]
+    async fn siblings_share_registrations_but_not_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let prod = McpServer::new(config(dir.path())).unwrap();
+        let beta = prod.sibling(IiInstance::beta().expect("beta instance"), "/mcp-beta");
+
+        let at_prod = register_at(prod.mcp_router()).await;
+        let at_beta = register_at(beta.mcp_router()).await;
+        for (server, name) in [(&prod, "prod"), (&beta, "beta")] {
+            let known = server.store.clients.registrations.read().await;
+            assert!(known.contains_key(&at_prod), "{name} does not know prod's client");
+            assert!(known.contains_key(&at_beta), "{name} does not know beta's client");
+        }
+
+        let (prod_token, beta_token) =
+            (prod.store.test_bearer().await, beta.store.test_bearer().await);
+        assert_eq!(ping(prod.mcp_router(), &prod_token).await, StatusCode::OK);
+        assert_eq!(ping(beta.mcp_router(), &beta_token).await, StatusCode::OK);
+        assert_eq!(ping(prod.mcp_router(), &beta_token).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(ping(beta.mcp_router(), &prod_token).await, StatusCode::UNAUTHORIZED);
     }
 }

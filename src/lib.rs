@@ -65,7 +65,8 @@
 //! from it with [`McpServer::sibling`]. Each is its own `McpServer` (sessions
 //! and tokens never cross instances) over the one state directory: dynamic
 //! client registrations (II-agnostic) persist to a single snapshot, and the
-//! deploy tools' caps hold across the process. Pass every instance to
+//! deploy tools' caps hold across the instances. Shutting one down stops the
+//! deploys of all ([`McpServer::shutdown`]). Pass every instance to
 //! [`auth_callbacks_router`] so the one allow-list document declares all
 //! callbacks.
 //!
@@ -212,7 +213,7 @@ impl McpServer {
             identities::Identities::new(config.instance, public_url.clone(), config.agent.clone());
         let store = auth::AuthStore::new(
             identities.clone(),
-            SharedClients::load(&config.state_dir),
+            SharedClients::load(&config.state_dir, deploy.owner()),
             public_url.clone(),
             mcp_path.clone(),
             config.require_resource,
@@ -238,7 +239,10 @@ impl McpServer {
     /// are now, and — shared, not copied — the client registrations and the
     /// deploy state, so a client registered at one is known to both and the
     /// deploy caps hold across them. Sessions and tokens are each
-    /// instance's own, and so is its [`Self::shutdown`].
+    /// instance's own, and so are its transport sessions, which
+    /// [`Self::shutdown`] cancels; but `shutdown` also stops the deploy
+    /// tools every sibling shares, so it is for stopping the process, not
+    /// for retiring one endpoint.
     pub fn sibling(&self, instance: IiInstance, mcp_path: &str) -> Self {
         let mcp_path = normalize_mount_path(mcp_path);
         let identities =

@@ -262,7 +262,10 @@ impl Default for BundleLimits {
 /// today, and is what a server on the user's own machine runs with.
 ///
 /// A plugin runs inside the server's own process, as many at once as deploys
-/// do, so a server that deploys for others sizes these to what it has.
+/// do, so a server that deploys for others sizes these to what it has. The
+/// memory limit is linear memory alone: the runtime's own allocations for a
+/// run (compiling the plugin, its tables, host buffers) come on top of it,
+/// so leave headroom.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PluginLimits {
     /// Linear memory, in bytes, summed across every memory the plugin has.

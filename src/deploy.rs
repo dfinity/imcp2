@@ -168,13 +168,15 @@ pub struct DeployConfig {
     /// upload, and again by the deploy. Adding a hash here is vouching for
     /// that program.
     pub allowed_plugins: Vec<String>,
-    /// What each run of a sync plugin is held to — its memory, its CPU time
-    /// and how long it may take from start to finish — where the default
-    /// leaves each at the icp CLI's own: 4 GiB, 60 seconds of compute, and
-    /// no limit on the run as a whole. A plugin runs inside the server's
-    /// process, one for each deploy at once ([`Self::concurrent`]), so the
-    /// memory limit times that is what plugins can take of the process's
-    /// memory together.
+    /// What each run of a sync plugin is held to — its linear memory, its
+    /// CPU time and how long it may take from start to finish — where the
+    /// default leaves each at the icp CLI's own: 4 GiB, 60 seconds of
+    /// compute, and no limit on the run as a whole. A plugin runs inside
+    /// the server's process, one for each deploy at once
+    /// ([`Self::concurrent`]), so the memory limit times that is the linear
+    /// memory plugins of this server and its siblings can take together.
+    /// The runtime's own allocations for a run (compiling the plugin, its
+    /// tables, host buffers) come on top of it: leave headroom.
     pub plugin_limits: PluginLimits,
 }
 
@@ -221,10 +223,13 @@ pub const DEPLOY_RECORD_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// How often the sweeper looks for what has lapsed.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
-/// What a process's deploy endpoints share: the slots deploys run in, the
+/// What a server's deploy endpoints share: the slots deploys run in, the
 /// store uploads are received into, and the word that the server is
-/// stopping. Cheap to clone; made once per process, by [`McpServer::new`]
-/// from [`crate::McpConfig::deploy`], and shared with the server's siblings. An embedder reaches it at [`McpServer::deploys`].
+/// stopping. Cheap to clone; made once per state directory, by
+/// [`McpServer::new`] from [`crate::McpConfig::deploy`], and shared with the
+/// server's siblings, so its caps hold across them — but not across servers
+/// built by separate `new` calls, each of which has its own. An embedder
+/// reaches it at [`McpServer::deploys`].
 #[derive(Clone)]
 pub struct Deploys {
     slots: DeploySlots,
@@ -334,6 +339,13 @@ impl Deploys {
             sweeping: Arc::default(),
             metrics: Reporting::default(),
         })
+    }
+
+    /// The lock on the state directory this owns, for what else keeps
+    /// files there (the client registrations) to hold it as long as it
+    /// writes them.
+    pub(crate) fn owner(&self) -> Arc<std::fs::File> {
+        self._owned.clone()
     }
 
     /// Wait for the deploys that were running at [`Self::stop`] to have
@@ -493,25 +505,31 @@ impl McpServer {
     /// bearer gate, and the upload route, which goes outside it (the ticket
     /// is its authentication). `transport` is the endpoint's configuration
     /// as the plain endpoint would use it.
-    pub(crate) fn deploy_mcp_routers(
-        &self,
-        deploys: &Deploys,
-        transport: StreamableHttpServerConfig,
-    ) -> (Router, Router) {
-        let uploads = deploys.uploads.clone();
+    /// The deploy tools this endpoint serves, over `deploys`.
+    fn deploy_tools(&self, deploys: &Deploys) -> IcDeployTools {
         let upload_url = format!("{}{}{UPLOAD_PATH}", self.public_url, self.mcp_path);
-        // The slots, the store and the stop are the process's, shared with
-        // every other endpoint and every router built from this server.
-        let deploy = IcDeployTools::new(self.identities.clone(), auth::bearer_session_resolver())
+        // The slots, the store and the stop are this state directory's,
+        // shared with every other endpoint and every router built from this
+        // server.
+        IcDeployTools::new(self.identities.clone(), auth::bearer_session_resolver())
             .with_slots(deploys.slots.clone())
             .stopped_by(deploys.stopping.clone())
             .deploys_in(&deploys.dir)
             // `Deploys::new` made the directory and refused a path that is
             // not UTF-8, which is all this can fail on.
             .unwrap_or_else(|e| panic!("the deploy directory, checked as it was made: {e}"))
-            .with_uploads(uploads.clone(), upload_url)
+            .with_uploads(deploys.uploads.clone(), upload_url)
             .with_plugin_limits(deploys.plugin_limits)
-            .observed_by(Arc::new(deploys.metrics.clone()));
+            .observed_by(Arc::new(deploys.metrics.clone()))
+    }
+
+    pub(crate) fn deploy_mcp_routers(
+        &self,
+        deploys: &Deploys,
+        transport: StreamableHttpServerConfig,
+    ) -> (Router, Router) {
+        let uploads = deploys.uploads.clone();
+        let deploy = self.deploy_tools(deploys);
         let service = |transport: StreamableHttpServerConfig| {
             let (agent, identities, deploy) =
                 (self.agent.clone(), self.identities.clone(), deploy.clone());
@@ -880,6 +898,35 @@ mod tests {
             cimd_enabled: false,
             deploy: config(),
         })
+    }
+
+    /// The sync-plugin limits a server is configured with are what the
+    /// deploy tools of each of its endpoints hold a plugin to, not the icp
+    /// CLI's defaults.
+    #[test]
+    fn the_configured_plugin_limits_reach_the_deploy_tools() {
+        let limits = PluginLimits {
+            memory_bytes: Some(256 << 20),
+            compute_secs: Some(7),
+            wall_clock: Some(Duration::from_secs(90)),
+        };
+        assert_ne!(limits, PluginLimits::default());
+        let dir = tempfile::tempdir().unwrap();
+        let server = McpServer::new(McpConfig {
+            agent: Agent::builder().with_url(IC_URL).build().expect("agent"),
+            instance: IiInstance::prod().expect("prod instance"),
+            public_url: "https://mcp.example.com".into(),
+            mcp_path: "/mcp".into(),
+            state_dir: dir.path().to_path_buf(),
+            require_resource: true,
+            cimd_enabled: false,
+            deploy: DeployConfig { plugin_limits: limits, ..config() },
+        })
+        .unwrap();
+        let beta = beside(&server);
+        for endpoint in [&server, &beta] {
+            assert_eq!(endpoint.deploy_tools(endpoint.deploys()).plugin_limits(), limits);
+        }
     }
 
     /// A second endpoint of `server`'s process, at `/mcp-beta`: the same

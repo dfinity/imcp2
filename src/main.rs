@@ -102,30 +102,51 @@ fn require_resource() -> bool {
 ///     in all (default: the icp CLI's own, which are 4 GiB, 60 seconds and
 ///     no limit). Zero is refused: it would run no plugin.
 ///
-/// A value that is not a whole number refuses to start, and so does one
-/// that contradicts another rather than being quietly bent to fit: a count
-/// of zero (the tools run at least one deploy), an archive cap over what a
-/// bundle may extract to (an archive is never larger than its contents),
-/// and a store too small for one bundle.
+/// A blank value (`NAME=`) reads as unset, as [`max_request_body_from`]
+/// reads its own. A value that is not Unicode refuses to start, naming the
+/// variable, rather than being read as unset; so does one that is not a
+/// whole number, and one that contradicts another rather than being
+/// quietly bent to fit: a count of zero (the tools run at least one
+/// deploy), an archive cap over what a bundle may extract to (an archive
+/// is never larger than its contents), and a store too small for one
+/// bundle.
 fn deploy_config() -> anyhow::Result<imcp2::deploy::DeployConfig> {
-    let var = |name: &str| std::env::var(name).ok();
-    deploy_config_from([
-        var("MCP_DEPLOY_MAX_CONCURRENT").as_deref(),
-        var("MCP_DEPLOY_MAX_UPLOAD_BYTES").as_deref(),
-        var("MCP_DEPLOY_MAX_EXTRACTED_BYTES").as_deref(),
-        var("MCP_DEPLOY_MAX_STORED_BYTES").as_deref(),
-    ])
-    .and_then(|config| {
-        Ok(imcp2::deploy::DeployConfig {
-            allowed_plugins: allowed_plugins(var("MCP_DEPLOY_ALLOWED_PLUGINS").as_deref()),
-            plugin_limits: plugin_limits_from([
-                var("MCP_DEPLOY_PLUGIN_MAX_MEMORY_BYTES").as_deref(),
-                var("MCP_DEPLOY_PLUGIN_MAX_COMPUTE_SECS").as_deref(),
-                var("MCP_DEPLOY_PLUGIN_MAX_WALL_CLOCK_SECS").as_deref(),
-            ])?,
-            ..config
-        })
+    let var = |name: &str| deploy_var(name, std::env::var(name));
+    let config = deploy_config_from([
+        var("MCP_DEPLOY_MAX_CONCURRENT")?.as_deref(),
+        var("MCP_DEPLOY_MAX_UPLOAD_BYTES")?.as_deref(),
+        var("MCP_DEPLOY_MAX_EXTRACTED_BYTES")?.as_deref(),
+        var("MCP_DEPLOY_MAX_STORED_BYTES")?.as_deref(),
+    ])?;
+    Ok(imcp2::deploy::DeployConfig {
+        allowed_plugins: allowed_plugins(var("MCP_DEPLOY_ALLOWED_PLUGINS")?.as_deref()),
+        plugin_limits: plugin_limits_from([
+            var("MCP_DEPLOY_PLUGIN_MAX_MEMORY_BYTES")?.as_deref(),
+            var("MCP_DEPLOY_PLUGIN_MAX_COMPUTE_SECS")?.as_deref(),
+            var("MCP_DEPLOY_PLUGIN_MAX_WALL_CLOCK_SECS")?.as_deref(),
+        ])?,
+        ..config
     })
+}
+
+/// One `$MCP_DEPLOY_*` variable's value (`name`'s, as `std::env::var` read
+/// it): `None` when it is unset or blank — the native deploy renders a
+/// variable nobody set as `NAME=` (see [`max_request_body_from`]) — and an
+/// error naming it when it is not Unicode, which is a value set wrong, not
+/// one left unset.
+fn deploy_var(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+) -> anyhow::Result<Option<String>> {
+    use std::env::VarError;
+    match value {
+        Ok(v) if v.trim().is_empty() => Ok(None),
+        Ok(v) => Ok(Some(v)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(raw)) => {
+            Err(anyhow::anyhow!("{name} is not valid UTF-8: {raw:?}"))
+        }
+    }
 }
 
 /// The three `$MCP_DEPLOY_PLUGIN_MAX_*` variables' values, in the order
@@ -853,6 +874,30 @@ mod tests {
         };
         assert!(refused.to_string().contains("not the sha256 of a plugin"), "{refused}");
         server(listed).unwrap();
+    }
+
+    /// A `$MCP_DEPLOY_*` variable that is blank reads as unset, as one that
+    /// is absent does; one that is not Unicode is refused, naming it, and
+    /// not mistaken for one that is absent.
+    #[test]
+    fn a_deploy_variable_blank_is_unset_and_not_unicode_is_refused() {
+        use super::deploy_var;
+        use std::env::VarError;
+        let name = "MCP_DEPLOY_PLUGIN_MAX_MEMORY_BYTES";
+        assert_eq!(deploy_var(name, Err(VarError::NotPresent)).unwrap(), None);
+        for blank in ["", " ", "\t", " \n"] {
+            assert_eq!(deploy_var(name, Ok(blank.into())).unwrap(), None, "{blank:?}");
+        }
+        assert_eq!(deploy_var(name, Ok(" 12 ".into())).unwrap().as_deref(), Some(" 12 "));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = std::ffi::OsString::from_vec(vec![b'1', b'2', 0xff]);
+            let err = deploy_var(name, Err(VarError::NotUnicode(raw)))
+                .expect_err("a value that is not Unicode is not an unset one");
+            assert!(err.to_string().contains(name), "{err}");
+        }
     }
 
     /// The deploy cap is a count of at least one: zero is refused at startup
