@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span};
 
 use crate::deploy::{
-    calls::{AgentCalls, UntilStopped},
+    calls::{AgentCalls, LedgerRefusal, UntilStopped},
     host::{self, AllowedPlugins, BundleLimits, PluginLimits},
 };
 
@@ -185,6 +185,11 @@ pub struct DeployOutcome {
     /// The phases and per-canister tasks the operation reported, with their
     /// outcomes, in completion order.
     pub log: Vec<String>,
+    /// The balance the cycles ledger reported as it refused to create a
+    /// canister because the balance did not cover it, when it did: the
+    /// user's cycles ran short. From the ledger's own answer
+    /// ([`LedgerRefusal`]), never from the wording of an error.
+    pub short_of_cycles: Option<u128>,
 }
 
 /// An error made before the deploy could begin: the request itself was
@@ -433,6 +438,7 @@ pub async fn deploy_bundle(
         canister_ids: request.canister_ids.clone(),
         error: None,
         log: Vec::new(),
+        short_of_cycles: None,
     };
     if canisters.is_empty() {
         return Ok(outcome);
@@ -459,15 +465,20 @@ pub async fn deploy_bundle(
     //
     // The calls stop being made when the deploy is told to stop, and say
     // whether any was made at all: see [`run_until_stopped`].
+    // They also note the cycles ledger refusing a creation for lack of
+    // cycles, which is how a deploy knows the user's balance ran short.
     let begun = Arc::new(AtomicBool::new(false));
+    let refusal = LedgerRefusal::default();
     let calls = Deferred::new({
-        let (stop, begun) = (watch.stop.clone(), begun.clone());
+        let (stop, begun, refusal) = (watch.stop.clone(), begun.clone(), refusal.clone());
         move || {
-            let (identity, stop, begun) = (identity.clone(), stop.clone(), begun.clone());
+            let (identity, stop) = (identity.clone(), stop.clone());
+            let (begun, refusal) = (begun.clone(), refusal.clone());
             async move {
                 let agent = mainnet_agent(identity).map_err(RequestError)?;
                 let calls = AgentCalls::new(agent).map_err(RequestError)?;
-                let calls: Arc<dyn CanisterCalls> = Arc::new(UntilStopped::new(calls, stop, begun));
+                let calls = UntilStopped::new(calls, stop, begun).noting(refusal);
+                let calls: Arc<dyn CanisterCalls> = Arc::new(calls);
                 Ok::<_, RequestError>(calls)
             }
         }
@@ -501,6 +512,7 @@ pub async fn deploy_bundle(
     drop(reporter);
     outcome.log = collector.await.unwrap_or_default();
     outcome.created = report.created;
+    outcome.short_of_cycles = refusal.balance();
 
     let interrupted = "the deploy was interrupted before it finished (the call was cancelled, the \
                        client went away or the server is stopping); `canister_ids` holds every \
@@ -658,14 +670,20 @@ pub const STOP_GRACE: Duration = Duration::from_secs(20);
 /// flight came back with, and is passed on — with the warning it calls for
 /// when a call went unanswered, since that call may have taken effect.
 fn interrupted_with(interrupted: &str, ended: &str) -> String {
-    if ended.contains(crate::deploy::calls::STOPPING) && !ended.contains("went unanswered") {
+    if ended.contains(crate::deploy::calls::STOPPING) && !went_unanswered(ended) {
         return interrupted.to_string();
     }
     let mut said = format!("{interrupted}. The run ended with: {ended}");
-    if ended.contains("went unanswered") {
+    if went_unanswered(ended) {
         said.push_str(UNANSWERED);
     }
     said
+}
+
+/// Whether `text`, an error chain or a line of a deploy's log, says that a
+/// call went unanswered: one that may have taken effect all the same.
+pub(super) fn went_unanswered(text: &str) -> bool {
+    text.contains("went unanswered")
 }
 
 /// What follows an error chain in which a call went unanswered: the call may
@@ -678,7 +696,7 @@ const UNANSWERED: &str = ". A call went unanswered: if it was creating a caniste
 /// went unanswered — a timeout or a dropped connection after the call was
 /// sent says nothing of whether it took effect.
 fn failed_with(ended: &str) -> String {
-    match ended.contains("went unanswered") {
+    match went_unanswered(ended) {
         true => format!("{ended}{UNANSWERED}"),
         false => ended.to_string(),
     }

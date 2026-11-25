@@ -914,9 +914,7 @@ impl IcDeployTools {
                 // Where the cycles ledger refused a creation, the answer
                 // says to whom cycles must be delivered and which funding
                 // providers there are.
-                output.funding = funding::after(&outcome, principal, cycles, &stopped)
-                    .instrument(span.clone())
-                    .await;
+                output.funding = funding::after(&outcome, principal, cycles);
                 let text = output.human();
                 let how = Told::Ended(how_it_ended(Ok(outcome.status)));
                 match outcome.status {
@@ -1721,6 +1719,7 @@ mod tests {
             canister_ids: [("backend".to_string(), Principal::management_canister())].into(),
             error: Some("install failed".into()),
             log: vec!["Creating canisters: ok".into()],
+            short_of_cycles: None,
         };
         let output = DeployBundleOutput::from_outcome(&outcome);
         assert_eq!(output.status, "failed");
@@ -1740,7 +1739,7 @@ mod tests {
         // the structured content, with the mapping it still returns.
         let mut output = DeployBundleOutput::from_outcome(&outcome);
         output.funding =
-            Some(Funding::new(Principal::management_canister(), 1, 2_000_000_000_000, Some(7)));
+            Some(Funding::new(Principal::management_canister(), 1, 2_000_000_000_000, 7));
         let text = output.human();
         assert!(text.contains("The cycles balance did not cover this deploy"), "{text}");
         assert!(text.contains("Funding providers:"), "{text}");

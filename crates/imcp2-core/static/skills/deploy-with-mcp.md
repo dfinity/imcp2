@@ -222,10 +222,9 @@ the error itself suggests. `funding` holds:
   Ledger account holds the balance, and is the account added cycles must be
   delivered to. It is not the user's principal in any app, the provider's
   included.
-- `needed`, and when the ledger answered, `balance` and `shortfall`, in
-  cycles: what the canisters still to create take, what is there, and what
-  is missing at the least. A `shortfall` of `0` means cycles arrived in the
-  meantime: add nothing, do steps 1 and 7 below.
+- `needed`, `balance` and `shortfall`, in cycles: what the canisters still
+  to create take, what the ledger said was there when it refused, and what
+  is missing at the least.
 - `providers`: the funding providers, each with a name, an `app_url` and how
   the user completes the checkout there.
 - `steps`: what to do next, the same for every provider.

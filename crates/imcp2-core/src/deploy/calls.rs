@@ -10,16 +10,19 @@
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use crate::guard_candid_text;
 use async_trait::async_trait;
-use candid::Principal;
+use candid::{Decode, Principal};
 use ic_agent::{
     agent::{CallResponse, EffectiveId, SubnetType},
     hash_tree::{HashTree, Label, LookupResult},
     Agent, AgentError,
+};
+use icp_canister_interfaces::cycles_ledger::{
+    CreateCanisterError, CreateCanisterResponse, CYCLES_LEDGER_PRINCIPAL,
 };
 use icp_project::calls::{Authority, Call, CallError, CanisterCalls, RouteTo};
 use tokio_util::sync::CancellationToken;
@@ -289,11 +292,20 @@ pub struct UntilStopped<C> {
     /// Set once any call has been let through: until then there is nothing
     /// in flight or unreported, and the deploy can be dropped where it is.
     begun: Arc<AtomicBool>,
+    /// Told when the cycles ledger refuses a creation for lack of cycles.
+    refusal: LedgerRefusal,
 }
 
 impl<C> UntilStopped<C> {
     pub fn new(inner: C, stop: CancellationToken, begun: Arc<AtomicBool>) -> Self {
-        Self { inner, stop, begun }
+        Self { inner, stop, begun, refusal: LedgerRefusal::default() }
+    }
+
+    /// Note in `refusal` when the cycles ledger refuses to create a canister
+    /// because the caller's balance does not cover it.
+    pub fn noting(mut self, refusal: LedgerRefusal) -> Self {
+        self.refusal = refusal;
+        self
     }
 
     /// Let a call through, or refuse it because the deploy is stopping. The
@@ -305,6 +317,47 @@ impl<C> UntilStopped<C> {
         }
         self.begun.store(true, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+/// The method that creates a canister, on the cycles ledger and on whatever
+/// else answers in its shape.
+const CREATE_CANISTER: &str = "create_canister";
+
+/// What a deploy's calls learned of the user's cycles balance: that the
+/// cycles ledger refused to create a canister because the balance did not
+/// cover it, and the balance it reported as it did. Shared by the calls,
+/// which note it, and the deploy, which reads it once they have ended.
+///
+/// It is taken from the ledger's own typed answer to a call that went to
+/// the ledger, and from nothing else. A cloud engine's operator creates
+/// canisters through the same method and answers in the same shape, and the
+/// icp library words both refusals alike, so the wording of a deploy's error
+/// cannot say whose balance fell short; where the call went can.
+#[derive(Clone, Default)]
+pub struct LedgerRefusal(Arc<Mutex<Option<u128>>>);
+
+impl LedgerRefusal {
+    /// The balance the cycles ledger reported when it refused a creation
+    /// for lack of cycles, if it did.
+    pub fn balance(&self) -> Option<u128> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Note `reply`, the answer to an update of `method` on `canister`, if
+    /// it is the cycles ledger refusing a creation for lack of cycles.
+    fn note(&self, canister: Principal, method: &str, reply: &[u8]) {
+        if canister != CYCLES_LEDGER_PRINCIPAL || method != CREATE_CANISTER {
+            return;
+        }
+        if let Ok(CreateCanisterResponse::Err(CreateCanisterError::InsufficientFunds { balance })) =
+            Decode!(reply, CreateCanisterResponse)
+        {
+            // A balance past what fits is not one that fell short of
+            // anything; it is kept as the most that fits.
+            let balance = u128::try_from(balance.0).unwrap_or(u128::MAX);
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(balance);
+        }
     }
 }
 
@@ -332,7 +385,10 @@ impl<C: CanisterCalls> CanisterCalls for UntilStopped<C> {
 
     async fn update(&self, call: Call) -> Result<Vec<u8>, CallError> {
         self.admit(call.canister, &call.method)?;
-        self.inner.update(call).await
+        let (canister, method) = (call.canister, call.method.clone());
+        let reply = self.inner.update(call).await?;
+        self.refusal.note(canister, &method, &reply);
+        Ok(reply)
     }
 
     async fn query(&self, call: Call) -> Result<Vec<u8>, CallError> {
@@ -374,6 +430,7 @@ impl<C: CanisterCalls> CanisterCalls for UntilStopped<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candid::Encode;
     use ic_agent::hash_tree::{fork, label, leaf, pruned};
 
     /// Calls whose update is answered when the test says so.
@@ -414,6 +471,90 @@ mod tests {
         async fn subnet_uses_engine_operator(&self, _subnet: Principal) -> Result<bool, CallError> {
             Ok(false)
         }
+    }
+
+    /// Calls whose every update is answered with these bytes.
+    struct Answering(Vec<u8>);
+
+    #[async_trait]
+    impl CanisterCalls for Answering {
+        fn caller(&self) -> Principal {
+            Principal::anonymous()
+        }
+        async fn update(&self, _call: Call) -> Result<Vec<u8>, CallError> {
+            Ok(self.0.clone())
+        }
+        async fn query(&self, _call: Call) -> Result<Vec<u8>, CallError> {
+            Ok(Vec::new())
+        }
+        async fn metadata_section(
+            &self,
+            _canister: Principal,
+            _path: &str,
+            _authority: Authority,
+        ) -> Result<Option<Vec<u8>>, CallError> {
+            Ok(None)
+        }
+        async fn controllers(
+            &self,
+            _canister: Principal,
+        ) -> Result<Option<Vec<Principal>>, CallError> {
+            Ok(None)
+        }
+        async fn module_hash(&self, _canister: Principal) -> Result<Option<Vec<u8>>, CallError> {
+            Ok(None)
+        }
+        async fn subnet_of(&self, canister: Principal) -> Result<Principal, CallError> {
+            Ok(canister)
+        }
+        async fn subnet_uses_engine_operator(&self, _subnet: Principal) -> Result<bool, CallError> {
+            Ok(false)
+        }
+    }
+
+    /// What the refusal holds after an update of `method` on `canister` is
+    /// answered with `reply`, and that the reply still reaches the caller.
+    async fn noted(canister: Principal, method: &str, reply: &[u8]) -> Option<u128> {
+        let refusal = LedgerRefusal::default();
+        let calls = UntilStopped::new(
+            Answering(reply.to_vec()),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .noting(refusal.clone());
+        let answer = calls.update(Call::new(canister, method, Vec::new())).await.unwrap();
+        assert_eq!(answer, reply, "the answer is passed on as it came");
+        refusal.balance()
+    }
+
+    // The cycles ledger refusing a creation for lack of cycles is noted,
+    // with the balance it reports. The same answer from anything else is
+    // not: a cloud engine's operator creates canisters through the same
+    // method and answers in the same shape, and it is not the user's
+    // ledger balance that fell short there. Nor is any other answer of the
+    // ledger's, or an answer that is not one at all.
+    #[tokio::test]
+    async fn only_the_ledgers_own_refusal_of_a_creation_is_noted() {
+        let short = Encode!(&CreateCanisterResponse::Err(CreateCanisterError::InsufficientFunds {
+            balance: candid::Nat::from(7u8)
+        }))
+        .unwrap();
+        assert_eq!(noted(CYCLES_LEDGER_PRINCIPAL, CREATE_CANISTER, &short).await, Some(7));
+
+        // An engine operator, answering alike.
+        assert_eq!(noted(canister(), CREATE_CANISTER, &short).await, None);
+        // The ledger, asked for something else.
+        assert_eq!(noted(CYCLES_LEDGER_PRINCIPAL, "icrc1_balance_of", &short).await, None);
+
+        let created = Encode!(&CreateCanisterResponse::Ok {
+            block_id: candid::Nat::from(1u8),
+            canister_id: canister(),
+        })
+        .unwrap();
+        assert_eq!(noted(CYCLES_LEDGER_PRINCIPAL, CREATE_CANISTER, &created).await, None);
+        let other = Encode!(&CreateCanisterResponse::Err(CreateCanisterError::TooOld)).unwrap();
+        assert_eq!(noted(CYCLES_LEDGER_PRINCIPAL, CREATE_CANISTER, &other).await, None);
+        assert_eq!(noted(CYCLES_LEDGER_PRINCIPAL, CREATE_CANISTER, b"not candid").await, None);
     }
 
     // The call that was in flight when the stop came is answered, and its
