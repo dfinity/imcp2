@@ -21,9 +21,11 @@ use std::{
 };
 
 use camino::{Utf8Path, Utf8PathBuf};
-use candid::Principal;
-use ic_agent::{Agent, Identity};
-use icp_canister_interfaces::engine_canister::engine_canister_id;
+use candid::{Decode, Encode, Principal};
+use ic_agent::{identity::AnonymousIdentity, Agent, Identity};
+use icp_canister_interfaces::{
+    cycles_ledger::CYCLES_LEDGER_BLOCK_FEE, engine_canister::engine_canister_id,
+};
 use icp_events::{EventKind, TaskId, TaskOutcome};
 use icp_project::{
     calls::CanisterCalls,
@@ -578,7 +580,9 @@ pub async fn deploy_bundle(
     outcome.canister_ids = ids_for_a_retry(seeded, stored.clone(), &outcome.created);
     if let Some(deploy_principal) = short_of_cycles {
         let to_create = still_to_create(&outcome.canisters, &outcome.canister_ids);
-        outcome.error = Some(insufficient_cycles(deploy_principal, params.cycles, to_create));
+        let quote = price_with_cyclepay(cycles_needed(params.cycles, to_create)).await;
+        outcome.error =
+            Some(insufficient_cycles(deploy_principal, params.cycles, to_create, quote));
     }
 
     // The outcome carries everything the directory recorded, but it has not
@@ -705,29 +709,190 @@ fn failed_with(ended: &str) -> String {
 
 /// Where the user can buy cycles by card for a principal: CyclePay credits
 /// them to the principal's cycles-ledger account, which is what canister
-/// creation spends. The principal is appended, then the amount (see
-/// [`cyclepay_url`]).
+/// creation spends. The principal is appended, then, when it could be priced,
+/// the amount (see [`cyclepay_url`]).
 pub const CYCLEPAY_URL: &str = "https://www.cyclepay.org/?dest=ledger&to=";
 
-/// The funds a deploy short of cycles asks for, in whole US dollars for each
-/// canister it has still to create. An estimate, and a fixed one: it follows
-/// neither the cycles a canister is created with nor the balance there is.
-pub const USD_PER_CANISTER: u64 = 3;
+/// CyclePay's backend canister on mainnet: it publishes the XDR/USD rate it
+/// prices orders at (`get_xdr_rate_status`) and its card terms
+/// (`get_card_terms`), both public queries, which price the link's amount.
+pub const CYCLEPAY_BACKEND: &str = "2bwus-iiaaa-aaaac-bee3a-cai";
 
-/// The most a CyclePay link preselects, in whole US dollars; a link that
-/// names more has its amount set aside.
-const CYCLEPAY_MAX_USD: u64 = 200;
+/// How long pricing the link may hold up a deploy's answer; past it, the
+/// link goes without an amount.
+const CYCLEPAY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The CyclePay page that funds `deploy_principal` with `usd` dollars
-/// preselected.
-fn cyclepay_url(deploy_principal: Principal, usd: u64) -> String {
-    format!("{CYCLEPAY_URL}{deploy_principal}&usd={usd}")
+/// Cycles per XDR, as the protocol pegs them: 1T cycles = 1 XDR.
+const CYCLES_PER_XDR: u128 = 1_000_000_000_000;
+
+/// The CyclePay page that funds `deploy_principal`, with `usd_cents`
+/// preselected when there is an amount.
+fn cyclepay_url(deploy_principal: Principal, usd_cents: Option<u64>) -> String {
+    match usd_cents {
+        Some(cents) => format!("{CYCLEPAY_URL}{deploy_principal}&usd={}", dollars(cents)),
+        None => format!("{CYCLEPAY_URL}{deploy_principal}"),
+    }
+}
+
+/// US cents as CyclePay's `usd` takes them: whole dollars, or dollars with
+/// two decimals.
+fn dollars(cents: u64) -> String {
+    match cents % 100 {
+        0 => format!("{}", cents / 100),
+        rest => format!("{}.{rest:02}", cents / 100),
+    }
+}
+
+/// A cycles amount in trillions, to four decimals at most.
+fn trillions(cycles: u128) -> String {
+    let tenths_of_a_billion = cycles / 100_000_000;
+    let (whole, rest) = (tenths_of_a_billion / 10_000, tenths_of_a_billion % 10_000);
+    let rest = format!("{rest:04}");
+    match rest.trim_end_matches('0') {
+        "" => format!("{whole}T"),
+        rest => format!("{whole}.{rest}T"),
+    }
 }
 
 /// How many of a deploy's canisters the mapping it returns has no id for:
 /// those a retry creates.
 fn still_to_create(canisters: &[String], ids: &BTreeMap<String, Principal>) -> usize {
     canisters.iter().filter(|name| !ids.contains_key(*name)).count()
+}
+
+/// The cycles a deploy needs for `to_create` canisters: each is funded with
+/// `cycles_per_canister` from the cycles ledger, which charges its fee on
+/// each creation. A run that failed creating a canister has at least that
+/// one to create.
+fn cycles_needed(cycles_per_canister: u128, to_create: usize) -> u128 {
+    let to_create = u128::try_from(to_create).unwrap_or(u128::MAX).max(1);
+    cycles_per_canister.saturating_add(CYCLES_LEDGER_BLOCK_FEE).saturating_mul(to_create)
+}
+
+/// What CyclePay prices a card order with, read from its backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CyclePayTerms {
+    /// US dollars per XDR, times 10 000.
+    xdr_usd_x10000: u64,
+    /// The card fee: `amount * fee_bps / 10_000 + fee_fixed_usd_cents`.
+    fee_bps: u64,
+    fee_fixed_usd_cents: u64,
+    /// Taken off a delivery to a cycles-ledger account, which the link's is.
+    ledger_delivery_fee_cycles: u128,
+    /// The range of a signed-in order.
+    min_order_usd_cents: u64,
+    max_order_usd_cents: u64,
+}
+
+/// What a CyclePay link asks the user to pay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Quote {
+    usd_cents: u64,
+    /// Lowered to the most one order may be: it buys less than is needed.
+    capped: bool,
+}
+
+/// What to pay CyclePay by card for `cycles` to reach a cycles-ledger
+/// account: the cycles plus the ledger delivery fee, in XDR at the protocol's
+/// peg, in US dollars at CyclePay's rate, grossed up for the card fee, each
+/// step rounded up to the cent so what is delivered covers `cycles`, then
+/// held to CyclePay's order range. `None` when the terms price nothing (no
+/// rate, or a fee that takes the whole amount).
+fn cyclepay_quote(cycles: u128, terms: &CyclePayTerms) -> Option<Quote> {
+    if terms.xdr_usd_x10000 == 0 || terms.fee_bps >= 10_000 {
+        return None;
+    }
+    let delivered = cycles.checked_add(terms.ledger_delivery_fee_cycles)?;
+    // cents = cycles / 1e12 XDR * (x10000 / 1e4) USD/XDR * 100.
+    let net =
+        delivered.checked_mul(u128::from(terms.xdr_usd_x10000))?.div_ceil(CYCLES_PER_XDR * 100);
+    // The fee taken off `gross`, rounded up.
+    let fee = |gross: u128| {
+        (gross * u128::from(terms.fee_bps)).div_ceil(10_000) + u128::from(terms.fee_fixed_usd_cents)
+    };
+    // The least gross whose fee leaves `net`: solved, then stepped past the
+    // fee's rounding.
+    let mut gross = (net.checked_add(u128::from(terms.fee_fixed_usd_cents))?)
+        .checked_mul(10_000)?
+        .div_ceil(10_000 - u128::from(terms.fee_bps));
+    while gross < fee(gross) + net {
+        gross += 1;
+    }
+    let capped = gross > u128::from(terms.max_order_usd_cents);
+    let usd_cents =
+        gross.max(u128::from(terms.min_order_usd_cents)).min(u128::from(terms.max_order_usd_cents));
+    Some(Quote { usd_cents: u64::try_from(usd_cents).ok()?, capped })
+}
+
+/// CyclePay's `XdrRateStatus`, in the fields read here.
+#[derive(candid::CandidType, serde::Deserialize)]
+struct XdrRateStatus {
+    xdr_usd_x10000: u64,
+    stale: bool,
+}
+
+/// CyclePay's `CardTerms`, in the fields read here.
+#[derive(candid::CandidType, serde::Deserialize)]
+struct CardTerms {
+    deliveries_paused: bool,
+    fee_bps: u64,
+    fee_fixed_usd_cents: u64,
+    ledger_delivery_fee_cycles: candid::Nat,
+    min_order_usd_cents: u64,
+    max_order_usd_cents: u64,
+}
+
+/// CyclePay's terms, read from its backend with two queries; an error when
+/// either fails, the rate is stale or orders are paused.
+async fn read_cyclepay_terms(agent: &Agent) -> Result<CyclePayTerms, String> {
+    let backend = Principal::from_text(CYCLEPAY_BACKEND).map_err(|e| e.to_string())?;
+    let empty = Encode!().map_err(|e| e.to_string())?;
+    let (rate, terms) = tokio::join!(
+        agent.query(&backend, "get_xdr_rate_status").with_arg(empty.clone()).call(),
+        agent.query(&backend, "get_card_terms").with_arg(empty).call(),
+    );
+    let rate = rate.map_err(|e| format!("get_xdr_rate_status failed: {e}"))?;
+    let rate =
+        Decode!(&rate, XdrRateStatus).map_err(|e| format!("decode get_xdr_rate_status: {e}"))?;
+    let terms = terms.map_err(|e| format!("get_card_terms failed: {e}"))?;
+    let terms = Decode!(&terms, CardTerms).map_err(|e| format!("decode get_card_terms: {e}"))?;
+    if rate.stale {
+        return Err("CyclePay's XDR/USD rate is stale".into());
+    }
+    if terms.deliveries_paused {
+        return Err("CyclePay's card orders are paused".into());
+    }
+    Ok(CyclePayTerms {
+        xdr_usd_x10000: rate.xdr_usd_x10000,
+        fee_bps: terms.fee_bps,
+        fee_fixed_usd_cents: terms.fee_fixed_usd_cents,
+        ledger_delivery_fee_cycles: u128::try_from(terms.ledger_delivery_fee_cycles.0)
+            .map_err(|e| format!("ledger_delivery_fee_cycles: {e}"))?,
+        min_order_usd_cents: terms.min_order_usd_cents,
+        max_order_usd_cents: terms.max_order_usd_cents,
+    })
+}
+
+/// What CyclePay would charge for `cycles` at its current rate, or `None`
+/// when that cannot be learned within [`CYCLEPAY_TIMEOUT`]: the link then
+/// goes without an amount. Asked anonymously: the queries are public.
+async fn price_with_cyclepay(cycles: u128) -> Option<Quote> {
+    let read = async {
+        let agent = mainnet_agent(Arc::new(AnonymousIdentity))?;
+        read_cyclepay_terms(&agent).await
+    };
+    let terms = match tokio::time::timeout(CYCLEPAY_TIMEOUT, read).await {
+        Ok(Ok(terms)) => terms,
+        Ok(Err(e)) => {
+            tracing::info!(error = %e, "could not price the CyclePay link");
+            return None;
+        }
+        Err(_) => {
+            tracing::info!("CyclePay did not answer in time to price the link");
+            return None;
+        }
+    };
+    cyclepay_quote(cycles, &terms)
 }
 
 /// Whether a deploy failed because the cycles ledger refused to create a
@@ -741,30 +906,45 @@ fn is_insufficient_cycles(error: &DeployError) -> bool {
     )
 }
 
-/// What a deploy that ran out of cycles says, for the agent to relay: what
-/// the funds needed are estimated at — [`USD_PER_CANISTER`] for each of the
-/// `to_create` canisters the deploy has still to create — where to buy
-/// cycles for that amount, for the principal to fund (the deploy identity's,
-/// which is not the one `icp_cycles_balance` reports), and what to do next.
-/// The library's own text is left out: its advice is the CLI's.
-fn insufficient_cycles(deploy_principal: Principal, cycles: u128, to_create: usize) -> String {
-    // A run that failed creating a canister has at least that one to create.
-    let to_create = u64::try_from(to_create).unwrap_or(u64::MAX).max(1);
-    let usd = USD_PER_CANISTER.saturating_mul(to_create);
+/// What a deploy that ran out of cycles says, for the agent to relay: the
+/// cycles needed for the `to_create` canisters the deploy has still to
+/// create (see [`cycles_needed`]), and a CyclePay link to buy them by card
+/// for the principal to fund (the deploy identity's, which is not the one
+/// `icp_cycles_balance` reports) — with what they cost when `quote` priced
+/// them — and what to do next. The library's own text is left out: its
+/// advice is the CLI's.
+fn insufficient_cycles(
+    deploy_principal: Principal,
+    cycles: u128,
+    to_create: usize,
+    quote: Option<Quote>,
+) -> String {
+    let needed = cycles_needed(cycles, to_create);
+    let to_create = to_create.max(1);
     let canisters = if to_create == 1 { "canister" } else { "canisters" };
-    let url = cyclepay_url(deploy_principal, usd.min(CYCLEPAY_MAX_USD));
+    let url = cyclepay_url(deploy_principal, quote.map(|q| q.usd_cents));
+    let costs = match quote {
+        None => String::new(),
+        Some(Quote { usd_cents, capped: false }) => {
+            format!(" for ${} at today's rate, fees included", dollars(usd_cents))
+        }
+        Some(Quote { usd_cents, capped: true }) => format!(
+            ", ${} at a time (the most one payment can be; pay again for the rest)",
+            dollars(usd_cents)
+        ),
+    };
     format!(
         "NOT ENOUGH CYCLES: the deploy could not create canister(s) because your Internet \
          Identity does not have enough cycles. Each new canister is funded with {cycles} cycles \
          from that identity's cycles balance. First, write the `canister_ids` returned here back \
          to the project now, whatever happens next: any canister already created is listed \
          there and will not be created again. Then tell the user, in these words or close to \
-         them: \"Your identity needs more cycles before this app can be deployed. The deployment \
-         funds needed are estimated at ${USD_PER_CANISTER} per canister: ${usd} for the \
-         {to_create} {canisters} still to be created. You can fund it with CyclePay at {url} — \
-         let me know once the payment has gone through and I'll retry deploying.\" Do not retry \
-         until the user confirms they are done funding; then retry deploying with the same \
-         bundle and those `canister_ids`."
+         them: \"Your identity needs more cycles before this app can be deployed: you need \
+         {needed} cycles ({}) to deploy the {to_create} {canisters} still to be created. You \
+         can buy them by card with CyclePay{costs}: {url} — let me know once the payment has \
+         gone through and I'll retry deploying.\" Do not retry until the user confirms they are \
+         done funding; then retry deploying with the same bundle and those `canister_ids`.",
+        trillions(needed)
     )
 }
 
@@ -1924,43 +2104,74 @@ mod tests {
         assert!(!is_insufficient_cycles(&error));
     }
 
+    /// CyclePay's terms as they stand: $1.35 to the XDR, Stripe's 2.9% +
+    /// $0.30, two ledger fees off a ledger delivery, $1 to $200 an order.
+    fn terms() -> CyclePayTerms {
+        CyclePayTerms {
+            xdr_usd_x10000: 13_500,
+            fee_bps: 290,
+            fee_fixed_usd_cents: 30,
+            ledger_delivery_fee_cycles: 200_000_000,
+            min_order_usd_cents: 100,
+            max_order_usd_cents: 20_000,
+        }
+    }
+
     #[test]
     fn running_out_of_cycles_names_the_principal_and_where_to_pay() {
         let deploy_principal = Principal::from_text("2vxsx-fae").unwrap();
-        let said = insufficient_cycles(deploy_principal, 2_000_000_000_000, 2);
+        let quote = Some(Quote { usd_cents: 589, capped: false });
+        let said = insufficient_cycles(deploy_principal, 2_000_000_000_000, 2, quote);
         assert!(said.starts_with("NOT ENOUGH CYCLES: "), "{said}");
-        // The estimate, and the link with the principal and that amount.
+        // The cycles needed, the price, and the link with the principal and
+        // that amount.
         assert!(
-            said.contains("estimated at $3 per canister: $6 for the 2 canisters still to be"),
+            said.contains(
+                "you need 4000200000000 cycles (4.0002T) to deploy the 2 canisters still to be \
+                 created"
+            ),
             "{said}"
         );
+        assert!(said.contains("with CyclePay for $5.89 at today's rate, fees included"), "{said}");
         assert!(
-            said.contains("https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae&usd=6 "),
+            said.contains("https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae&usd=5.89 "),
             "{said}"
         );
-        assert!(said.contains("You can fund it with CyclePay at"), "{said}");
         // The ids are saved before the user is told, not after they have paid.
         let (save, tell) = (said.find("write the `canister_ids`"), said.find("Then tell the user"));
-        assert!(save.zip(tell).is_some_and(|(save, tell)| save < tell), "{said}");
-        // The library's text, whose advice is the CLI's, is not passed on.
-        assert!(!said.contains("Details") && !said.contains("icp cycles mint"), "{said}");
+        assert!(save.unwrap() < tell.unwrap(), "{said}");
+        assert!(said.contains("Do not retry until the user confirms"), "{said}");
+        // One line, as the continuation escapes keep it.
         assert!(!said.contains('\n') && !said.contains("  "), "{said}");
     }
 
     #[test]
-    fn the_funds_asked_for_go_by_the_canisters_still_to_create() {
+    fn running_out_of_cycles_unpriced_still_says_what_is_needed_and_where() {
         let deploy_principal = Principal::from_text("2vxsx-fae").unwrap();
-        let said = |to_create| insufficient_cycles(deploy_principal, 2_000_000_000_000, to_create);
-        // One canister, and the run that failed creating one has no fewer.
-        for to_create in [0, 1] {
-            let said = said(to_create);
-            assert!(said.contains("$3 for the 1 canister still to be created"), "{said}");
-            assert!(said.contains("to=2vxsx-fae&usd=3 "), "{said}");
-        }
-        // The link names no more than CyclePay preselects; the estimate is whole.
-        let said = said(70);
-        assert!(said.contains("$210 for the 70 canisters still to be created"), "{said}");
+        let said = insufficient_cycles(deploy_principal, 2_000_000_000_000, 1, None);
+        assert!(
+            said.contains("you need 2000100000000 cycles (2.0001T) to deploy the 1 canister still"),
+            "{said}"
+        );
+        assert!(said.contains("by card with CyclePay: https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae — let me know"), "{said}");
+        assert!(!said.contains("usd=") && !said.contains('$'), "{said}");
+        assert!(!said.contains('\n') && !said.contains("  "), "{said}");
+
+        // A price held to the most one order may be says so.
+        let capped = Some(Quote { usd_cents: 20_000, capped: true });
+        let said = insufficient_cycles(deploy_principal, 2_000_000_000_000, 0, capped);
+        assert!(said.contains("$200 at a time (the most one payment can be"), "{said}");
         assert!(said.contains("to=2vxsx-fae&usd=200 "), "{said}");
+        // A run that failed creating a canister has at least that one to create.
+        assert!(said.contains("the 1 canister still to be created"), "{said}");
+    }
+
+    #[test]
+    fn the_cycles_needed_go_by_the_canisters_still_to_create() {
+        // Each creation funds the canister and pays the ledger's fee.
+        assert_eq!(cycles_needed(2_000_000_000_000, 3), 6_000_300_000_000);
+        assert_eq!(cycles_needed(2_000_000_000_000, 0), 2_000_100_000_000);
+        assert_eq!(cycles_needed(u128::MAX, 2), u128::MAX);
 
         // Those to create are the deploy's canisters the mapping has no id for.
         let id = Principal::management_canister();
@@ -1968,6 +2179,63 @@ mod tests {
         let ids = BTreeMap::from([("frontend".to_string(), id), ("other".to_string(), id)]);
         assert_eq!(still_to_create(&canisters, &ids), 2);
         assert_eq!(still_to_create(&canisters, &BTreeMap::new()), 3);
+    }
+
+    #[test]
+    fn cyclepay_prices_the_cycles_with_its_fees_rounded_up() {
+        // 4.0002T + 0.0002T delivery fee = 4.0004 XDR = $5.40054, so $5.41
+        // must arrive; $5.89 less its fee ($0.48, rounded up) is $5.41.
+        let quote = cyclepay_quote(4_000_200_000_000, &terms()).unwrap();
+        assert_eq!(quote, Quote { usd_cents: 589, capped: false });
+
+        // Whatever the amount, the price is the least that, less its fee
+        // rounded up, still delivers the cycles.
+        let t = terms();
+        let fee = |gross: u128| (gross * 290).div_ceil(10_000) + 30;
+        for cycles in (0..400).map(|i| i * 377_000_000_000u128 + 12_345) {
+            let net = (cycles + t.ledger_delivery_fee_cycles) * 13_500;
+            let net = net.div_ceil(100_000_000_000_000);
+            let quote = cyclepay_quote(cycles, &t).unwrap();
+            let gross = u128::from(quote.usd_cents);
+            if quote.capped {
+                assert_eq!(quote.usd_cents, t.max_order_usd_cents);
+            } else if gross > u128::from(t.min_order_usd_cents) {
+                assert!(gross - fee(gross) >= net, "{cycles}: {gross}");
+                assert!(gross - 1 - fee(gross - 1) < net, "{cycles}: {gross}");
+            }
+        }
+    }
+
+    #[test]
+    fn cyclepay_prices_are_held_to_its_order_range() {
+        // Too little to order is raised to the least order.
+        assert_eq!(cyclepay_quote(1, &terms()), Some(Quote { usd_cents: 100, capped: false }));
+        // More than one order is lowered to the most, and said to be.
+        let quote = cyclepay_quote(1_000_000_000_000_000, &terms());
+        assert_eq!(quote, Some(Quote { usd_cents: 20_000, capped: true }));
+        // Terms that price nothing give no price.
+        assert_eq!(cyclepay_quote(1, &CyclePayTerms { xdr_usd_x10000: 0, ..terms() }), None);
+        assert_eq!(cyclepay_quote(1, &CyclePayTerms { fee_bps: 10_000, ..terms() }), None);
+        assert_eq!(cyclepay_quote(u128::MAX, &terms()), None);
+    }
+
+    #[test]
+    fn amounts_are_written_as_cyclepay_and_people_read_them() {
+        assert_eq!(dollars(500), "5");
+        assert_eq!(dollars(589), "5.89");
+        assert_eq!(dollars(5), "0.05");
+        assert_eq!(dollars(20_010), "200.10");
+        assert_eq!(trillions(2_000_100_000_000), "2.0001T");
+        assert_eq!(trillions(1_000_000_000_000), "1T");
+        assert_eq!(trillions(1_500_000_000_000), "1.5T");
+        assert_eq!(trillions(0), "0T");
+        let p = Principal::from_text("2vxsx-fae").unwrap();
+        assert_eq!(cyclepay_url(p, None), "https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae");
+        assert_eq!(
+            cyclepay_url(p, Some(1_234)),
+            "https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae&usd=12.34"
+        );
+        assert_eq!(CYCLEPAY_BACKEND.parse::<Principal>().unwrap().to_text(), CYCLEPAY_BACKEND);
     }
 
     #[test]
