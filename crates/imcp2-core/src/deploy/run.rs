@@ -718,7 +718,7 @@ fn insufficient_cycles(deploy_principal: Principal, cycles: u128, ended: &str) -
     let details = ended.split_whitespace().collect::<Vec<_>>().join(" ");
     format!(
         "NOT ENOUGH CYCLES: the deploy could not create canister(s) because the Internet Identity it \
-         deploys as, principal {deploy_principal}, does not have enough cycles. Each new \
+         deploys as does not have enough cycles. Each new \
          canister is funded with {cycles} cycles from that identity's cycles balance. Tell the \
          user, in these words or close to them: \"Your identity \
          needs more cycles before this app can be deployed. You can fund future with \
