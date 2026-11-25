@@ -171,7 +171,11 @@ interrupts the deploy at its next step. It answers with the status
 canister-id mapping — pass it back next time to upgrade — the canisters
 created, and a log of each phase. A failed or interrupted deploy still reports
 every canister it created before that, so the run can be picked up rather than
-repeated.
+repeated. A deploy that fails because the deploy account cannot pay for a new
+canister says so with an error starting `NOT ENOUGH CYCLES`: it names that
+account's principal and a [CyclePay](https://www.cyclepay.org) link that buys
+cycles by card for it (`https://www.cyclepay.org/?dest=ledger&to=<principal>`),
+for the agent to relay to you.
 
 Calls are signed as your **default Internet Identity account at
 `https://cli.id.ai`**, the origin `icp identity link web` links an icp CLI

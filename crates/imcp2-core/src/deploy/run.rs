@@ -30,7 +30,8 @@ use icp_project::{
     defer::Deferred,
     host::EnvironmentSelection,
     operations::{
-        deploy::{deploy, resolve_targets, DeployParams, DeployReport},
+        create::CreateOperationError,
+        deploy::{deploy, resolve_targets, DeployError, DeployParams, DeployReport},
         task::Task,
     },
     prelude::{IC_MAINNET_NETWORK_API_URL, IC_ROOT_KEY},
@@ -460,6 +461,8 @@ pub async fn deploy_bundle(
     // The calls stop being made when the deploy is told to stop, and say
     // whether any was made at all: see [`run_until_stopped`].
     let begun = Arc::new(AtomicBool::new(false));
+    // The principal that pays for creation, named if it cannot.
+    let sender = identity.sender().ok();
     let calls = Deferred::new({
         let (stop, begun) = (watch.stop.clone(), begun.clone());
         move || {
@@ -523,7 +526,11 @@ pub async fn deploy_bundle(
         // retry, and a retry creates what the mapping does not list.
         Some(Err(e)) => {
             outcome.status = Status::Failed;
-            outcome.error = Some(failed_with(&error_chain(&e)));
+            let ended = error_chain(&e);
+            outcome.error = Some(match (is_insufficient_cycles(&e), sender) {
+                (true, Some(sender)) => insufficient_cycles(sender, params.cycles, &ended),
+                _ => failed_with(&ended),
+            });
         }
         None => {
             outcome.status = Status::Interrupted;
@@ -682,6 +689,44 @@ fn failed_with(ended: &str) -> String {
         true => format!("{ended}{UNANSWERED}"),
         false => ended.to_string(),
     }
+}
+
+/// Where the user can buy cycles by card for a principal: CyclePay credits
+/// them to the principal's cycles-ledger account, which is what canister
+/// creation spends. The principal is appended.
+pub const CYCLEPAY_URL: &str = "https://www.cyclepay.org/?dest=ledger&to=";
+
+/// Whether a deploy failed because the cycles ledger refused to create a
+/// canister for want of cycles. The variant is typed; which refusal it was is
+/// said only in its text, which the ledger interface's `format_error` writes.
+fn is_insufficient_cycles(error: &DeployError) -> bool {
+    matches!(
+        error,
+        DeployError::Create { source: CreateOperationError::CreateCanister { message } }
+            if message.starts_with("Insufficient cycles")
+    )
+}
+
+/// What a deploy that ran out of cycles says, for the agent to relay: the
+/// principal to fund — the deploy identity's, which is not the one
+/// `icp_cycles_balance` reports — where to buy cycles for it, and what to do
+/// next. The library's own text, whose advice is the CLI's, follows as the
+/// details.
+fn insufficient_cycles(sender: Principal, cycles: u128, ended: &str) -> String {
+    let details = ended.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "NOT ENOUGH CYCLES: the deploy could not create canister(s) because the account it \
+         deploys as, principal {sender}, does not have enough cycles. Each new canister is \
+         funded with {cycles} cycles from that account's cycles balance. Tell the user, in these \
+         words or close to them: \"Your deploy account ({sender}) needs more cycles before this \
+         app can be deployed. You can buy cycles by card with CyclePay at \
+         {CYCLEPAY_URL}{sender} — let me know once the payment has gone through and I'll \
+         deploy again.\" Do not retry until the user confirms they have paid. Then deploy \
+         again with the same bundle and with the `canister_ids` returned here (write them back to the \
+         project first): any canister already created is listed there and will not be created \
+         again. Note: this is the deploy account, not the principal `icp_cycles_balance` \
+         reports. Details: {details}"
+    )
 }
 
 /// Run a deploy until it ends or `stop` is cancelled, and say how it ended;
@@ -1806,6 +1851,59 @@ mod tests {
         // Nothing created: the store's word, or the seed's.
         assert_eq!(ids_for_a_retry(seeded.clone(), Some(map(&[("backend", 1)])), &[]), seeded);
         assert_eq!(ids_for_a_retry(seeded.clone(), None, &[]), seeded);
+    }
+
+    /// The ledger's refusal for want of cycles, worded by the ledger
+    /// interface itself, so that a change to its wording fails here.
+    fn insufficient_funds() -> DeployError {
+        use icp_canister_interfaces::cycles_ledger::CreateCanisterError;
+        let message = CreateCanisterError::InsufficientFunds { balance: 150_000_000_000u64.into() }
+            .format_error(2_000_000_000_000);
+        DeployError::Create { source: CreateOperationError::CreateCanister { message } }
+    }
+
+    #[test]
+    fn running_out_of_cycles_is_recognised() {
+        assert!(is_insufficient_cycles(&insufficient_funds()));
+        // Other refusals of the ledger's are not.
+        use icp_canister_interfaces::cycles_ledger::CreateCanisterError;
+        for other in [
+            CreateCanisterError::TemporarilyUnavailable,
+            CreateCanisterError::TooOld,
+            CreateCanisterError::FailedToCreate {
+                error: "Insufficient cycles on the subnet".into(),
+                refund_block: None,
+                fee_block: None,
+            },
+        ] {
+            let message = other.format_error(2_000_000_000_000);
+            let error =
+                DeployError::Create { source: CreateOperationError::CreateCanister { message } };
+            assert!(!is_insufficient_cycles(&error), "{}", error_chain(&error));
+        }
+        let error = DeployError::NoCreate { canisters: vec!["backend".into()] };
+        assert!(!is_insufficient_cycles(&error));
+    }
+
+    #[test]
+    fn running_out_of_cycles_names_the_principal_and_where_to_pay() {
+        let sender = Principal::from_text("2vxsx-fae").unwrap();
+        let said =
+            insufficient_cycles(sender, 2_000_000_000_000, &error_chain(&insufficient_funds()));
+        assert!(said.starts_with("NOT ENOUGH CYCLES: "), "{said}");
+        assert!(said.contains("principal 2vxsx-fae"), "{said}");
+        assert!(said.contains("https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae "), "{said}");
+        assert!(said.contains("`icp_cycles_balance`"), "{said}");
+        // The library's text is kept, on one line.
+        assert!(
+            said.contains(
+                "Details: failed to create canister: Insufficient cycles. Requested: \
+                 2000000000000 cycles, available balance: 150_000_000_000 cycles. use `icp cycles \
+                 mint`"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains('\n') && !said.contains("  "), "{said}");
     }
 
     #[test]
