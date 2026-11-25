@@ -30,7 +30,8 @@ use icp_project::{
     defer::Deferred,
     host::EnvironmentSelection,
     operations::{
-        deploy::{deploy, resolve_targets, DeployParams, DeployReport},
+        create::CreateOperationError,
+        deploy::{deploy, resolve_targets, DeployError, DeployParams, DeployReport},
         task::Task,
     },
     prelude::{IC_MAINNET_NETWORK_API_URL, IC_ROOT_KEY},
@@ -460,6 +461,8 @@ pub async fn deploy_bundle(
     // The calls stop being made when the deploy is told to stop, and say
     // whether any was made at all: see [`run_until_stopped`].
     let begun = Arc::new(AtomicBool::new(false));
+    // The principal that pays for creation, named if it cannot.
+    let deploy_principal = identity.sender().ok();
     let calls = Deferred::new({
         let (stop, begun) = (watch.stop.clone(), begun.clone());
         move || {
@@ -505,6 +508,8 @@ pub async fn deploy_bundle(
     let interrupted = "the deploy was interrupted before it finished (the call was cancelled, the \
                        client went away or the server is stopping); `canister_ids` holds every \
                        canister it is known to have created";
+    // The principal to fund, when the run failed for want of cycles.
+    let mut short_of_cycles = None;
     match result {
         Some(Ok(())) => outcome.status = Status::Deployed,
         // Stopped, the run ends in an error: the refusal of the call it went
@@ -523,7 +528,17 @@ pub async fn deploy_bundle(
         // retry, and a retry creates what the mapping does not list.
         Some(Err(e)) => {
             outcome.status = Status::Failed;
-            outcome.error = Some(failed_with(&error_chain(&e)));
+            let ended = error_chain(&e);
+            match deploy_principal.filter(|_| is_insufficient_cycles(&e)) {
+                // Worded below, once the ids are read back: the funds it
+                // asks for go by the canisters still to be created. The
+                // ledger's own words stay in the server's log.
+                Some(deploy_principal) => {
+                    tracing::info!(%ended, "the deploy ran out of cycles");
+                    short_of_cycles = Some(deploy_principal);
+                }
+                None => outcome.error = Some(failed_with(&ended)),
+            }
         }
         None => {
             outcome.status = Status::Interrupted;
@@ -561,6 +576,10 @@ pub async fn deploy_bundle(
     };
     let seeded = std::mem::take(&mut outcome.canister_ids);
     outcome.canister_ids = ids_for_a_retry(seeded, stored.clone(), &outcome.created);
+    if let Some(deploy_principal) = short_of_cycles {
+        let to_create = still_to_create(&outcome.canisters, &outcome.canister_ids);
+        outcome.error = Some(insufficient_cycles(deploy_principal, params.cycles, to_create));
+    }
 
     // The outcome carries everything the directory recorded, but it has not
     // reached the caller yet: it is sent after this returns, and a client
@@ -682,6 +701,89 @@ fn failed_with(ended: &str) -> String {
         true => format!("{ended}{UNANSWERED}"),
         false => ended.to_string(),
     }
+}
+
+/// Where the user can buy cycles by card for a principal: CyclePay credits
+/// them to the principal's cycles-ledger account, which is what canister
+/// creation spends. The principal is appended, then the amount and the tag
+/// of a tool's link (see [`cyclepay_url`]).
+pub const CYCLEPAY_URL: &str = "https://www.cyclepay.org/?dest=ledger&to=";
+
+/// The funds a deploy short of cycles asks for, in whole US dollars for each
+/// canister it has still to create. An estimate, and a fixed one: it follows
+/// neither the cycles a canister is created with nor the balance there is.
+/// It leaves room for the card fee, which takes more of a small amount.
+pub const USD_PER_CANISTER: u64 = 4;
+
+/// The least a deploy short of cycles asks for, in whole US dollars: the
+/// least CyclePay takes by card from a user who has not signed in there.
+pub const CYCLEPAY_MIN_USD: u64 = 5;
+
+/// The most CyclePay takes by card in one payment from a user who has not
+/// signed in there, in whole US dollars; a link that names more asks for a
+/// sign-in first.
+const CYCLEPAY_MAX_USD: u64 = 100;
+
+/// The CyclePay page that funds `deploy_principal` with `usd` dollars
+/// preselected. `from=icp-cli` is the tag CyclePay reads for a tool's link:
+/// it opens the short checkout, the account and the amount on one screen
+/// with the button that goes on to Stripe.
+fn cyclepay_url(deploy_principal: Principal, usd: u64) -> String {
+    format!("{CYCLEPAY_URL}{deploy_principal}&usd={usd}&from=icp-cli")
+}
+
+/// How many of a deploy's canisters the mapping it returns has no id for:
+/// those a retry creates.
+fn still_to_create(canisters: &[String], ids: &BTreeMap<String, Principal>) -> usize {
+    canisters.iter().filter(|name| !ids.contains_key(*name)).count()
+}
+
+/// Whether a deploy failed because the cycles ledger refused to create a
+/// canister for want of cycles. The variant is typed; which refusal it was is
+/// said only in its text, which the ledger interface's `format_error` writes.
+fn is_insufficient_cycles(error: &DeployError) -> bool {
+    matches!(
+        error,
+        DeployError::Create { source: CreateOperationError::CreateCanister { message } }
+            if message.starts_with("Insufficient cycles")
+    )
+}
+
+/// What a deploy that ran out of cycles says, for the agent to relay: what
+/// the funds needed are estimated at — [`USD_PER_CANISTER`] for each of the
+/// `to_create` canisters the deploy has still to create, and no less than
+/// [`CYCLEPAY_MIN_USD`] — where to buy cycles for that amount, for the
+/// principal to fund (the deploy identity's), and what to do next. An
+/// estimate over what one payment takes says so: the link is then for one
+/// payment's most. The library's own text is left out: its advice is the
+/// CLI's.
+fn insufficient_cycles(deploy_principal: Principal, cycles: u128, to_create: usize) -> String {
+    // A run that failed creating a canister has at least that one to create.
+    let to_create = u64::try_from(to_create).unwrap_or(u64::MAX).max(1);
+    let usd = USD_PER_CANISTER.saturating_mul(to_create).max(CYCLEPAY_MIN_USD);
+    let canisters = if to_create == 1 { "canister" } else { "canisters" };
+    let url = cyclepay_url(deploy_principal, usd.min(CYCLEPAY_MAX_USD));
+    let in_parts = if usd > CYCLEPAY_MAX_USD {
+        format!(
+            " One payment is ${CYCLEPAY_MAX_USD} at the most, which is what the link is for; \
+             the rest takes further payments there."
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "NOT ENOUGH CYCLES: the deploy could not create canister(s) because your Internet \
+         Identity does not have enough cycles. Each new canister is funded with {cycles} cycles \
+         from that identity's cycles balance. First, write the `canister_ids` returned here back \
+         to the project now, whatever happens next: any canister already created is listed \
+         there and will not be created again. Then tell the user, in these words or close to \
+         them: \"Your identity needs more cycles before this app can be deployed. The deployment \
+         funds needed are estimated at ${USD_PER_CANISTER} per canister, ${CYCLEPAY_MIN_USD} at \
+         the least: ${usd} for the {to_create} {canisters} still to be created. You can fund it \
+         with CyclePay at {url} — let me know once the payment has gone through and I'll retry \
+         deploying.{in_parts}\" Do not retry until the user confirms they are done funding; \
+         then retry deploying with the same bundle and those `canister_ids`."
+    )
 }
 
 /// Run a deploy until it ends or `stop` is cancelled, and say how it ended;
@@ -1806,6 +1908,102 @@ mod tests {
         // Nothing created: the store's word, or the seed's.
         assert_eq!(ids_for_a_retry(seeded.clone(), Some(map(&[("backend", 1)])), &[]), seeded);
         assert_eq!(ids_for_a_retry(seeded.clone(), None, &[]), seeded);
+    }
+
+    /// The ledger's refusal for want of cycles, worded by the ledger
+    /// interface itself, so that a change to its wording fails here.
+    fn insufficient_funds() -> DeployError {
+        use icp_canister_interfaces::cycles_ledger::CreateCanisterError;
+        let message = CreateCanisterError::InsufficientFunds { balance: 150_000_000_000u64.into() }
+            .format_error(2_000_000_000_000);
+        DeployError::Create { source: CreateOperationError::CreateCanister { message } }
+    }
+
+    #[test]
+    fn running_out_of_cycles_is_recognised() {
+        assert!(is_insufficient_cycles(&insufficient_funds()));
+        // Other refusals of the ledger's are not.
+        use icp_canister_interfaces::cycles_ledger::CreateCanisterError;
+        for other in [
+            CreateCanisterError::TemporarilyUnavailable,
+            CreateCanisterError::TooOld,
+            CreateCanisterError::FailedToCreate {
+                error: "Insufficient cycles on the subnet".into(),
+                refund_block: None,
+                fee_block: None,
+            },
+        ] {
+            let message = other.format_error(2_000_000_000_000);
+            let error =
+                DeployError::Create { source: CreateOperationError::CreateCanister { message } };
+            assert!(!is_insufficient_cycles(&error), "{}", error_chain(&error));
+        }
+        let error = DeployError::NoCreate { canisters: vec!["backend".into()] };
+        assert!(!is_insufficient_cycles(&error));
+    }
+
+    #[test]
+    fn running_out_of_cycles_names_the_principal_and_where_to_pay() {
+        let deploy_principal = Principal::from_text("2vxsx-fae").unwrap();
+        let said = insufficient_cycles(deploy_principal, 2_000_000_000_000, 2);
+        assert!(said.starts_with("NOT ENOUGH CYCLES: "), "{said}");
+        // The estimate, and the link with the principal and that amount.
+        assert!(
+            said.contains(
+                "estimated at $4 per canister, $5 at the least: $8 for the 2 canisters still to be"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae&usd=8&from=icp-cli "),
+            "{said}"
+        );
+        assert!(said.contains("You can fund it with CyclePay at"), "{said}");
+        // The ids are saved before the user is told, not after they have paid.
+        let (save, tell) = (said.find("write the `canister_ids`"), said.find("Then tell the user"));
+        assert!(save.zip(tell).is_some_and(|(save, tell)| save < tell), "{said}");
+        // The library's text, whose advice is the CLI's, is not passed on.
+        assert!(!said.contains("Details") && !said.contains("icp cycles mint"), "{said}");
+        assert!(!said.contains('\n') && !said.contains("  "), "{said}");
+    }
+
+    #[test]
+    fn the_funds_asked_for_go_by_the_canisters_still_to_create() {
+        let deploy_principal = Principal::from_text("2vxsx-fae").unwrap();
+        let said = |to_create| insufficient_cycles(deploy_principal, 2_000_000_000_000, to_create);
+        // One canister, and the run that failed creating one has no fewer:
+        // the least asked for, which is more than one canister's estimate.
+        for to_create in [0, 1] {
+            let said = said(to_create);
+            assert!(said.contains("$5 for the 1 canister still to be created"), "{said}");
+            assert!(said.contains("to=2vxsx-fae&usd=5&from=icp-cli "), "{said}");
+            assert!(!said.contains("One payment is"), "{said}");
+        }
+        // The most one payment takes is asked for whole, in one link.
+        let said_25 = said(25);
+        assert!(said_25.contains("$100 for the 25 canisters still to be created"), "{said_25}");
+        assert!(said_25.contains("to=2vxsx-fae&usd=100&from=icp-cli "), "{said_25}");
+        assert!(!said_25.contains("One payment is"), "{said_25}");
+        // Past it the estimate is whole, the link is for one payment's most,
+        // and the user is told the rest takes more.
+        let said_70 = said(70);
+        assert!(said_70.contains("$280 for the 70 canisters still to be created"), "{said_70}");
+        assert!(said_70.contains("to=2vxsx-fae&usd=100&from=icp-cli "), "{said_70}");
+        assert!(
+            said_70.contains(
+                "deploying. One payment is $100 at the most, which is what the link is for; the \
+                 rest takes further payments there.\" Do not retry"
+            ),
+            "{said_70}"
+        );
+        assert!(!said_70.contains('\n') && !said_70.contains("  "), "{said_70}");
+
+        // Those to create are the deploy's canisters the mapping has no id for.
+        let id = Principal::management_canister();
+        let canisters = ["backend".to_string(), "frontend".to_string(), "worker".to_string()];
+        let ids = BTreeMap::from([("frontend".to_string(), id), ("other".to_string(), id)]);
+        assert_eq!(still_to_create(&canisters, &ids), 2);
+        assert_eq!(still_to_create(&canisters, &BTreeMap::new()), 3);
     }
 
     #[test]

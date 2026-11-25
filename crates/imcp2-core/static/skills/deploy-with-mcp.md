@@ -44,7 +44,9 @@ not know the canisters already exist and would create a second set.
   client, then retry.
 - Cycles. Each new canister is created from the user's cycles balance, 2T
   cycles unless `cycles` says otherwise. Before a deploy that will create canisters, tell the
-  user how many and confirm; creation is not undone by a later failure.
+  user how many and confirm; creation is not undone by a later failure. The
+  balance spent is the deploy account's (the user's Internet Identity account
+  at `https://cli.id.ai`).
 - An environment on the `ic` network (mainnet), which every manifest has.
   The tool deploys to the Internet Computer only: an environment on any other
   network — the default `local`, a testnet — is refused. Deploy those with
@@ -268,3 +270,14 @@ created and their ids.
    canister the deploy had created. Do step 3 with that file's contents,
    delete the directory, and only then deploy again; otherwise the retry
    creates a second set.
+9. **NOT ENOUGH CYCLES.** The deploy account could not pay for a new
+   canister. The error says what the funds needed are estimated at, $4 for
+   each canister still to be created and $5 at the least, and gives a
+   CyclePay link
+   (`https://www.cyclepay.org/?dest=ledger&to=<principal>&usd=<amount>&from=icp-cli`)
+   where the user can buy cycles by card, for the deploy principal and that
+   amount. First do step 3 with the returned `canister_ids`, right away and
+   whether or not the user pays: a canister created before the failure is in
+   the mapping and is not created again. Then relay the estimate and the
+   link to the user as given, and do not retry until they say they have
+   paid; then deploy again with the same bundle and that mapping.
