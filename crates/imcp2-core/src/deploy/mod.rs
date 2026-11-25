@@ -10,6 +10,10 @@
 //! upgraded in place; every phase of `icp deploy` runs — including the sync
 //! steps that upload a frontend canister's assets.
 //!
+//! Beside it, `icp_funding_options`: the balance those canisters are created
+//! from, the principal that holds it, and where the user can buy cycles when
+//! it is short (see [`funding`]).
+//!
 //! Calls are signed as the user's default Internet Identity account at
 //! [`CLI_ORIGIN`] (`https://cli.id.ai`), the origin `icp identity link web`
 //! links an `icp` identity to. When the CLI's selected identity is such a
@@ -68,9 +72,10 @@ use std::{
     time::Instant,
 };
 
-use crate::{identities::Identities, SessionResolver};
+use crate::{cycles_balance_of, identities::Identities, SessionResolver};
 use camino::{Utf8Path, Utf8PathBuf};
 use candid::Principal;
+use ic_agent::Identity;
 #[allow(deprecated)]
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::{
@@ -85,6 +90,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 mod calls;
+pub mod funding;
 mod host;
 mod identity;
 mod observe;
@@ -92,6 +98,9 @@ mod run;
 mod server;
 mod uploads;
 
+pub use funding::{
+    FundingOptions, FundingOptionsArgs, FundingProvider, FundingProviderOutput, FUNDING_PROVIDERS,
+};
 pub use host::{
     occupies, AllowedPlugins, BundleLimits, PluginLimits, BLOCK_BYTES, ENTRY_BYTES, KNOWN_PLUGINS,
 };
@@ -113,6 +122,9 @@ pub const DEPLOY_TOOL: &str = "icp_deploy";
 /// The name of the upload-ticket tool, listed only by a server with an
 /// upload store (see [`IcDeployTools::with_uploads`]).
 pub const UPLOAD_TOOL: &str = "icp_deploy_upload";
+/// The name of the tool that reports the balance deploys spend and where
+/// the user can buy cycles (see [`funding`]).
+pub const FUNDING_TOOL: &str = "icp_funding_options";
 /// The deploy tool's step on handing the bundle over, as its description
 /// says it: by the upload tool, which only a server with an upload store
 /// lists. A server without one says [`PATH_STEP`] in its place (see
@@ -279,7 +291,12 @@ impl DeployBundleOutput {
                 .iter()
                 .map(|(n, id)| (n.clone(), id.to_text()))
                 .collect(),
-            error: outcome.error.clone(),
+            // A deploy the balance did not cover is told where cycles are
+            // to be had, in the error a client of either kind reads.
+            error: outcome
+                .error
+                .as_deref()
+                .map(|error| funding::with_funding_hint(error, &outcome.log)),
             log: outcome.log.clone(),
         }
     }
@@ -420,8 +437,8 @@ pub fn request_from_args(
 }
 
 /// The deploy tool group, served alongside the core surface by the binary
-/// that composes it: `icp_deploy`, and `icp_deploy_upload` on a server
-/// that takes bundles by upload.
+/// that composes it: `icp_deploy`, `icp_funding_options` for the balance it
+/// spends, and `icp_deploy_upload` on a server that takes bundles by upload.
 #[derive(Clone)]
 pub struct IcDeployTools {
     identities: Identities,
@@ -706,7 +723,7 @@ impl IcDeployTools {
     }
 
     #[tool(
-        description = "Deploy an ICP app to the Internet Computer. The steps: (1) bundle the project in the user's environment with `icp project bundle --output <file>.tar.gz`; (2) upload that bundle via icp_deploy_upload; (3) save the `canister_ids` this tool returns, unchanged, into `.icp/data/mappings/<environment>.ids.json` file of the project. Skipping step 3 makes the next deploy create a new set of canisters instead of upgrading these. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created, so write it back then too. The resource `skill://deploy-with-mcp` has the full guide.",
+        description = "Deploy an ICP app to the Internet Computer. New canisters are created from the user's cycles balance: icp_funding_options reports it and where to buy cycles. The steps: (1) bundle the project in the user's environment with `icp project bundle --output <file>.tar.gz`; (2) upload that bundle via icp_deploy_upload; (3) save the `canister_ids` this tool returns, unchanged, into `.icp/data/mappings/<environment>.ids.json` file of the project. Skipping step 3 makes the next deploy create a new set of canisters instead of upgrading these. The call lasts as long as the deploy and reports each phase as it completes, as a progress notification (send a progressToken) and a log message; cancelling the call interrupts the deploy at its next step. Returns the status, the resulting canister-id mapping, and a log of each phase; on failure or interruption the mapping still holds every canister that was created, so write it back then too. The resource `skill://deploy-with-mcp` has the full guide.",
         annotations(title = "Deploy a project bundle", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
         output_schema = schema_for_output::<DeployBundleOutput>(),
     )]
@@ -891,6 +908,52 @@ impl IcDeployTools {
                 }
             }
         }
+    }
+
+    #[tool(
+        name = "icp_funding_options",
+        description = "Report the cycles balance icp_deploy creates canisters from, and where the user can buy more. Returns the principal whose Cycles Ledger account holds the balance, which is the account bought cycles must be delivered to; the balance; what a deploy creating `canisters` canisters needs and how much of it is missing; and the funding providers, each an Internet Computer app whose own API doc says how to order (read it with open_app and get_canister_api_doc), with the steps that are the same for all of them. Whichever provider the user picks, the order answers one payment URL, and the user confirms a single payment there, on the provider's page: this server takes no payment. Call it before a deploy that will create canisters, and when icp_deploy fails for lack of cycles.",
+        annotations(title = "Check deploy cycles and funding options", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
+        output_schema = schema_for_output::<FundingOptions>(),
+    )]
+    async fn icp_funding_options(
+        &self,
+        Parameters(args): Parameters<FundingOptionsArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Whose balance: the session's principal at the origin deploys sign
+        // at, derived as a deploy derives it.
+        let Some(sid) = (self.session)(&ctx) else {
+            return Ok(err(
+                "checking the cycles for a deploy needs an authenticated session".into()
+            ));
+        };
+        let identity = match self.identities.delegated_identity(&sid, CLI_ORIGIN, None).await {
+            Ok(identity) => identity,
+            Err(e) => return Ok(err(e)),
+        };
+        let principal = match identity.sender() {
+            Ok(principal) => principal,
+            Err(e) => return Ok(err(format!("could not derive the deploy principal: {e}"))),
+        };
+        // The balance a deploy draws on is the one on the Internet Computer,
+        // whatever endpoint the rest of the server is pointed at.
+        let agent = match run::mainnet_agent(Arc::new(identity)) {
+            Ok(agent) => agent,
+            Err(e) => return Ok(err(e)),
+        };
+        let balance = match cycles_balance_of(&agent, principal).await {
+            Ok(balance) => balance,
+            Err(e) => return Ok(err(e)),
+        };
+        let Some(cycles) = funding::parse_cycles(&balance.balance) else {
+            return Ok(err(format!(
+                "the cycles ledger answered a balance of '{}'",
+                balance.balance
+            )));
+        };
+        let options = FundingOptions::new(balance.principal, cycles, &args);
+        Ok(ok_structured(options.human(), &options))
     }
 
     #[tool(
@@ -1240,6 +1303,9 @@ mod tests {
             "bundle_path",
             "bundle_upload",
             "authenticate",
+            "icp_funding_options",
+            "get_canister_api_doc",
+            "payment URL",
         ] {
             assert!(body.contains(needle), "the skill must mention `{needle}`");
         }
@@ -1259,13 +1325,35 @@ mod tests {
 
     // The group carries the deploy tool, with honest annotations (it creates
     // canisters and can wipe state) and an object-rooted outputSchema like
-    // every tool on the core surface, and the upload-ticket tool beside it.
+    // every tool on the core surface, and beside it the upload-ticket tool
+    // and the read-only one that reports the balance a deploy spends and
+    // where cycles are sold.
     #[test]
-    fn the_router_carries_the_deploy_and_upload_tools() {
+    fn the_router_carries_the_deploy_upload_and_funding_tools() {
         let tools = IcDeployTools::tool_router().list_all();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         let upload = tools.iter().find(|t| &*t.name == UPLOAD_TOOL).expect("upload ticket tool");
         assert_eq!(upload.annotations.clone().expect("annotations").destructive_hint, Some(false));
+
+        let funding = tools.iter().find(|t| &*t.name == FUNDING_TOOL).expect("funding options");
+        let ann = funding.annotations.clone().expect("annotations");
+        assert_eq!(ann.read_only_hint, Some(true));
+        assert_eq!(ann.destructive_hint, Some(false));
+        let schema = serde_json::to_value(&funding.input_schema).unwrap();
+        for field in ["canisters", "cycles"] {
+            assert!(schema["properties"][field].is_object(), "missing {field}: {schema}");
+        }
+        assert!(schema["required"].is_null(), "every argument is optional: {schema}");
+        let output =
+            serde_json::to_value(funding.output_schema.as_ref().expect("outputSchema")).unwrap();
+        for field in ["principal", "balance", "needed", "shortfall", "providers", "steps"] {
+            assert!(output["properties"][field].is_object(), "missing {field}: {output}");
+        }
+        // It says what the answer is for, and that nothing is paid here.
+        let said = funding.description.as_deref().expect("a description");
+        for needle in ["open_app", "get_canister_api_doc", "payment URL", "takes no payment"] {
+            assert!(said.contains(needle), "`{needle}` in: {said}");
+        }
 
         let tool = tools.iter().find(|t| &*t.name == DEPLOY_TOOL).expect("deploy");
         let ann = tool.annotations.clone().expect("annotations");
@@ -1337,6 +1425,8 @@ mod tests {
             let tools = tools.tools();
             let uploads = listed == "bundle_upload";
             assert_eq!(tools.iter().any(|t| &*t.name == UPLOAD_TOOL), uploads);
+            // Where the cycles come from is asked of either kind of server.
+            assert!(tools.iter().any(|t| &*t.name == FUNDING_TOOL));
             let deploy = tools.iter().find(|t| &*t.name == DEPLOY_TOOL).expect("deploy");
             let schema = serde_json::to_value(&deploy.input_schema).unwrap();
             assert!(schema["properties"][listed].is_object(), "{schema}");
@@ -1353,6 +1443,7 @@ mod tests {
             assert!(said.contains(&whole), "{said}");
             assert!(!said.contains(unlisted), "{said}");
             assert_eq!(said.contains(UPLOAD_TOOL), uploads, "{said}");
+            assert!(said.contains(FUNDING_TOOL), "{said}");
         }
     }
 
@@ -1661,5 +1752,21 @@ mod tests {
         let result = err_structured(text, &output);
         assert_eq!(result.is_error, Some(true));
         assert_eq!(result.structured_content.unwrap()["canister_ids"]["backend"], "aaaaa-aa");
+        assert!(!output.human().contains(FUNDING_TOOL), "not a failure for lack of cycles");
+
+        // A deploy the balance did not cover names the funding tool, in the
+        // error both the text and the structured content carry.
+        let short = DeployOutcome {
+            error: Some(
+                "create frontend: Insufficient cycles. Requested: 2000000000000 cycles, \
+                 available balance: 7 cycles."
+                    .into(),
+            ),
+            ..outcome
+        };
+        let output = DeployBundleOutput::from_outcome(&short);
+        assert!(output.error.as_deref().is_some_and(|e| e.contains(FUNDING_TOOL)), "{output:?}");
+        assert!(output.human().contains(FUNDING_TOOL));
+        assert!(output.human().contains("- backend: aaaaa-aa"), "the mapping is still there");
     }
 }

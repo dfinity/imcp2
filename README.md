@@ -34,10 +34,13 @@ one of the financial-service canisters it carries. An update call needs the
 canister's published interface: a canister that publishes none, or whose
 interface cannot be read, receives no update call through this server, so
 every update the server sends was checked against the canister's own
-interface. The connector serves no
-funding or management tools: creating, funding, and topping up
-canisters is done by the user with the
-[`icp` CLI](https://github.com/dfinity/icp-cli) in their own terminal.
+interface. The connector takes no payment and transfers no cycles:
+`icp_deploy` creates canisters from cycles the user already holds, and when
+those run short `icp_funding_options` only reports the balance and where
+cycles are sold. The user buys them on the provider's own page (see
+[Funding a deploy](#funding-a-deploy)), or with the
+[`icp` CLI](https://github.com/dfinity/icp-cli) in their own terminal, which
+is also where a canister is topped up.
 For financial operations, users act themselves outside the connector, in a
 trusted interface they control.
 
@@ -754,6 +757,64 @@ binary does: a drain that began first would wait on deploys nothing had told
 to stop. After the drain, and before `shutdown` or exiting, it awaits
 `Deploys::stopped`: a bounded wait for each deploy to have ended, which a
 drain does not cover when a deploy's client has already gone.
+
+### Funding a deploy
+
+`icp_deploy` creates canisters from the cycles-ledger balance of the
+principal it signs as, 2T cycles each unless the call says otherwise. A user
+deploying for the first time usually has none, so the deploy tools come with
+a read-only companion, **`icp_funding_options`** (`canisters?`, `cycles?`),
+which answers three questions: how much is there, to whom bought cycles must
+be delivered, and where they are sold.
+
+| Field | What it is |
+|---|---|
+| `principal` | The principal `icp_deploy` creates canisters as (the user's default account at `https://cli.id.ai`). Its Cycles Ledger account holds the balance and is the account an order must credit. |
+| `balance` | That account's balance, in cycles. |
+| `needed`, `shortfall` | With `canisters`: what creating that many takes (each canister's cycles plus the ledger's fee), and how much of it the balance does not cover. |
+| `providers` | Where the user can buy cycles: `name`, `app_url`, `pays_with`. |
+| `steps` | What an agent does with a provider, the same for every one. |
+
+The server knows no payment provider. It keeps a list of apps
+(`imcp2_core::deploy::FUNDING_PROVIDERS`), each a name, a URL and a phrase
+on how the user pays there:
+
+| Provider | App URL | Pays with |
+|---|---|---|
+| CyclePay | `https://www.cyclepay.org` | card, on Stripe's checkout page |
+
+Everything else comes from the provider, through the
+[service-discoverability](https://docs.internetcomputer.org/guides/frontends/service-discoverability/)
+layers the tools above already read: `open_app` on the provider's URL finds
+the canister its manifest declares, `get_canister_api_doc` returns the
+provider's own guide to quoting and ordering, and the order is an ordinary
+`canister_update_call`. Whichever provider the user picks, the flow ends the
+same way: the order call takes no payment and answers **one payment URL**;
+the user opens it and confirms a single payment on the provider's page; the
+cycles arrive on `principal`'s Cycles Ledger account; `icp_deploy` spends
+them. For CyclePay that is `create_order` with a `Ledger` destination and
+`principal` as `beneficiary`, answering a Stripe link, and none of it is
+written into the server: the agent reads it from CyclePay's API doc at the
+time of the order.
+
+What this buys:
+
+- **Another provider is one entry in the list.** No adapter, no method name,
+  no fee table to keep in step with someone else's canister.
+- **A provider's manifest is its switch.** The manifest gates every call to
+  its canisters, so a provider that takes it down can no longer be ordered
+  from through this server, with no release here.
+- **The financial guard is unchanged.** The order goes through
+  `canister_update_call` and its three checks like any other call. A
+  provider can be listed only if its order method moves no assets itself,
+  which is exactly what passes: a name with no financial keyword, on a
+  canister with no ICRC-1 or ICRC-2 method. No payment detail reaches the
+  server or the agent.
+
+A deploy that fails with the ledger's `Insufficient cycles` says so with a
+pointer to `icp_funding_options` in its `error`, after the canisters it did
+create. [`docs/scoping-cycles-funding.md`](docs/scoping-cycles-funding.md)
+has the design, what an entry in the list takes, and what was left out.
 
 ## Connect from an MCP client
 

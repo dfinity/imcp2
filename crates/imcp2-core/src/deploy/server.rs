@@ -78,6 +78,8 @@ impl<H: ServerHandler> WithDeploy<H> {
     /// The paragraph on deploying: short, since every client reads it, and
     /// saying nothing of whose principal signs or of how many deploys run at
     /// once, which no agent acts on (a server that is full says so when asked).
+    /// Of funding it says the one thing an agent must know before it looks:
+    /// that the balance and the places to buy cycles are a tool's answer.
     fn deploying(&self) -> String {
         let bundle = if self.deploy.has_uploads() {
             "Upload the bundle first: `icp_deploy_upload` returns the curl command, and the \
@@ -93,7 +95,9 @@ impl<H: ServerHandler> WithDeploy<H> {
              each phase. It returns `canister_ids`, the app's development metadata: write it \
              unchanged to the project's `.icp/data/mappings/<environment>.ids.json` and pass \
              that file's content back on the next deploy, or the next deploy creates new \
-             canisters. The resource \
+             canisters. `icp_funding_options` reports the cycles balance and, when it is \
+             short, where the user can buy cycles: they pay on the provider's own page, never \
+             here. The resource \
              `skill://deploy-with-mcp` has the full steps."
         )
     }

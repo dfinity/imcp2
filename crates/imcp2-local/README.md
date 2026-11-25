@@ -185,6 +185,15 @@ not the management identity the canister lifecycle tools act as (see
 add their principal as a controller. The session must have been granted
 "Actions & questions" at sign-in.
 
+Before a deploy that will create canisters, `icp_funding_options` reports
+the cycles balance of that principal, what the deploy needs, and where you
+can buy cycles when the balance is short (CyclePay, by card, to begin with).
+The server takes no payment: the agent makes an order with the provider you
+pick, through the provider's own published interface, and hands you the
+payment URL it answers; you confirm one payment on the provider's page, and
+the cycles arrive on the account the deploy spends from. The repository
+README's "Funding a deploy" has the details.
+
 One deploy runs at a time: a second call while one is running is refused
 rather than queued, since the mapping it carries would be stale by the time
 it ran. The bundle is extracted into a working directory under your local
