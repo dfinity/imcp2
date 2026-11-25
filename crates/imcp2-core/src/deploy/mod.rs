@@ -92,7 +92,9 @@ mod run;
 mod server;
 mod uploads;
 
-pub use host::{occupies, AllowedPlugins, BundleLimits, BLOCK_BYTES, ENTRY_BYTES, KNOWN_PLUGINS};
+pub use host::{
+    occupies, AllowedPlugins, BundleLimits, PluginLimits, BLOCK_BYTES, ENTRY_BYTES, KNOWN_PLUGINS,
+};
 use identity::RefreshingIdentity;
 pub use observe::{DeployObserver, Ended, Refused};
 pub use run::{
@@ -405,6 +407,7 @@ pub fn request_from_args(
         bundle,
         limits: BundleLimits::LOCAL,
         plugins: AllowedPlugins::Any,
+        plugin_limits: PluginLimits::default(),
         environment,
         canister_ids,
         mode,
@@ -439,6 +442,8 @@ pub struct IcDeployTools {
     uploads: Option<(Uploads, String)>,
     /// Told how each deploy call went; see [`Self::observed_by`].
     observer: Option<Arc<dyn DeployObserver>>,
+    /// What each sync plugin run is held to; see [`Self::with_plugin_limits`].
+    plugin_limits: PluginLimits,
 }
 
 /// How many deploys a server runs at once, and for whom. A clone is the same
@@ -558,7 +563,31 @@ impl IcDeployTools {
             deploys_dir: None,
             uploads: None,
             observer: None,
+            plugin_limits: PluginLimits::default(),
         }
+    }
+
+    /// Hold each sync plugin a deploy runs to `limits` — its memory, its CPU
+    /// time and how long it may take — instead of the icp CLI's defaults. A
+    /// plugin runs inside this process, so a server that deploys for others
+    /// sets what it can spare; see [`PluginLimits`].
+    pub fn with_plugin_limits(mut self, limits: PluginLimits) -> Self {
+        self.plugin_limits = limits;
+        self
+    }
+
+    /// What each sync plugin a deploy runs is held to
+    /// ([`Self::with_plugin_limits`]).
+    pub fn plugin_limits(&self) -> PluginLimits {
+        self.plugin_limits
+    }
+
+    /// Set on `request` what the server decides for every deploy, whatever
+    /// the call asked: what each sync plugin is held to, and where the
+    /// deploy's working directory is made.
+    fn apply_settings(&self, request: &mut DeployRequest) {
+        request.plugin_limits = self.plugin_limits;
+        request.workdir = self.deploys_dir.clone();
     }
 
     /// Tell `observer` how each deploy call goes — refused, or how it ended
@@ -803,7 +832,7 @@ impl IcDeployTools {
         let mut request = into_request(source);
         request.limits = limits;
         request.plugins = plugins;
-        request.workdir = self.deploys_dir.clone();
+        self.apply_settings(&mut request);
         // A per-app delegation lives five minutes and a deploy can outlast
         // it (an asset sync, several installs), so the identity the agent
         // signs with is kept fresh for as long as the deploy runs.
@@ -1168,6 +1197,27 @@ mod tests {
     }
     fn by_upload(json: serde_json::Value) -> Result<DeployRequest, String> {
         request_from_args(args(json), true).map(|(b, into)| into(BundleSource::Path(b.into())))
+    }
+
+    /// The plugin limits a server sets are what every deploy it runs is
+    /// held to, not the icp CLI's defaults the request starts from.
+    #[test]
+    fn a_deploy_is_held_to_the_servers_plugin_limits() {
+        let limits = PluginLimits {
+            memory_bytes: Some(256 << 20),
+            compute_secs: Some(7),
+            wall_clock: Some(std::time::Duration::from_secs(90)),
+        };
+        let tools = tools().with_plugin_limits(limits);
+        assert_eq!(tools.plugin_limits(), limits);
+        let mut request = by_path(serde_json::json!({
+            "bundle_path": "/tmp/app.tar.gz",
+            "environment": "ic",
+        }))
+        .unwrap();
+        assert_eq!(request.plugin_limits, PluginLimits::default());
+        tools.apply_settings(&mut request);
+        assert_eq!(request.plugin_limits, limits);
     }
 
     // The skill is in the registry's SKILL.md shape (frontmatter naming it as

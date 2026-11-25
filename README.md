@@ -74,24 +74,24 @@ crate it should eventually be sourced through — releases against the same
 ic-agent line; see `Cargo.toml`.)
 
 ```rust
-use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, SharedClients, IC_URL};
+use imcp2::{auth_callbacks_router, Agent, IiInstance, McpConfig, McpServer, IC_URL};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Standalone: a default mainnet agent. Embedded: hand in the host's own.
     let agent = Agent::builder().with_url(IC_URL).build()?;
-    // Where imcp2 keeps operational state (the client-registration store).
-    let state_dir = std::path::PathBuf::from("/var/lib/imcp2");
     let server = McpServer::new(McpConfig {
         agent,
         instance: IiInstance::beta().map_err(anyhow::Error::msg)?,
         public_url: "https://mcp.example.com".into(),
         mcp_path: "/mcp".into(),
-        clients: SharedClients::load(&state_dir),
-        state_dir,
+        // Where imcp2 keeps operational state (the client-registration store,
+        // and the deploy tools' uploads and records).
+        state_dir: "/var/lib/imcp2".into(),
         require_resource: true, // strict RFC 8707 (reject a missing `resource`)
         cimd_enabled: true, // Client ID Metadata Documents (URL client_ids); false turns them off
-    });
+        deploy: Default::default(), // the deploy tools' caps (see `imcp2::deploy`)
+    })?;
     server.spawn_session_reaper();
     let app = axum::Router::new()
         // nest_service (not nest): it also forwards the trailing-slash form.
@@ -122,8 +122,10 @@ GET  /.well-known/ii-auth-callbacks                (origin-global, all instances
 GET  /.well-known/ii-app-metadata                  (origin-global: name + legal links shown by II)
 ```
 
-Several instances share one origin by giving each its own `McpServer` (one
-shared `SharedClients`, one `auth_callbacks_router` over all of them) — exactly
+Several instances share one origin by giving each its own `McpServer` (the
+first from `McpServer::new`, the others from its `sibling`, which shares the
+client registrations and the deploy state; one `auth_callbacks_router` over
+all of them) — exactly
 what the bundled binary does on staging, serving production Internet Identity at
 `/mcp` and beta at `/mcp-beta` (see below).
 
@@ -545,8 +547,7 @@ conventions.
 ## Deploying a project bundle
 
 The server also serves the deploy tools (`imcp2_core::deploy`) on the MCP
-endpoint — the bundled binary always, an application that embeds the crate
-where it turns them on (`McpServer::with_deploy`): `icp_deploy`
+endpoint, configured at `McpConfig::deploy`: `icp_deploy`
 deploys an [icp CLI](https://github.com/dfinity/icp-cli) project bundle to the
 Internet Computer as the user — every phase of `icp deploy`, creating the
 canisters that do not exist yet from the user's cycles balance and upgrading
@@ -650,7 +651,7 @@ What the hosted composition adds to the local one:
   while it is sent would otherwise have no record of the canisters it paid
   for.
 - **Bounds.** One deploy per session and `$MCP_DEPLOY_MAX_CONCURRENT` across
-  sessions and endpoints (the slots are the process's, shared by `/mcp` and
+  sessions and endpoints (the slots are the server's, shared by `/mcp` and
   `/mcp-beta`), refused past the cap rather than queued. Each deploy's
   directory is made under `{state_dir}/deploys`, readable by the server's user
   alone, and removed when the deploy returns unless it is kept as a record
@@ -665,9 +666,22 @@ What the hosted composition adds to the local one:
   its modules expand to, are bounded by the bundle host as well.
 - **Only the sync plugins the server knows are run.** A sync plugin is a
   program the bundle brings and the server runs — in WASI, with read-only
-  access to its own deploy directory and no network, under a compute budget,
-  but with no memory limit short of its address space, and inside the
-  server's own process. So this server runs the plugin releases it knows and
+  access to its own deploy directory and no network, inside the server's own
+  process. Each run is held to limits the server sets and a bundle cannot:
+  `$MCP_DEPLOY_PLUGIN_MAX_MEMORY_BYTES` of linear memory,
+  `$MCP_DEPLOY_PLUGIN_MAX_COMPUTE_SECS` of CPU time (waiting on a canister
+  call is not counted) and `$MCP_DEPLOY_PLUGIN_MAX_WALL_CLOCK_SECS` from
+  start to finish. Unset, each is the icp CLI's own default — 4 GiB, 60
+  seconds, and no limit on the whole run — which stops nothing a plugin does
+  today; a plugin runs for each deploy at once, so the memory limit times
+  `$MCP_DEPLOY_MAX_CONCURRENT` is the linear memory plugins can take
+  together. That is not all a run takes: compiling the plugin, its tables
+  and the host's buffers are the runtime's own allocations, outside the
+  limit, so leave headroom over it. A zero, a value that is not a whole
+  number, or one that is not valid UTF-8 stops the server from starting; a
+  blank one (`NAME=`) is read as unset, as for every `$MCP_DEPLOY_*`
+  variable.
+  And this server runs the plugin releases it knows and
   no others, each known by the sha256 of its module (which is what `icp
   project bundle` records for it), never by the name or path the bundle
   gives it:
@@ -716,24 +730,30 @@ What the hosted composition adds to the local one:
   already does: the counters are fed as things happen and the gauges by
   `Metrics::refresh`.
 
-The deploy tools are part of every build: there is no feature to turn on. The
-bundled binary always serves them; an application that embeds the `imcp2`
-crate serves them once it calls `McpServer::with_deploy`, and not before.
+The deploy tools are part of every build and of every server: there is no
+feature and no setting to turn them on. The bundled binary serves them, and
+so does an application that embeds the `imcp2` crate — including the bundle
+upload route, which is outside the bearer gate and authenticated by its
+one-time ticket.
 Nothing here is read from the environment by the library: the `$MCP_DEPLOY_*` variables above are the bundled binary's, which
 maps them onto `imcp2::deploy::DeployConfig`, and an embedder sets that
-struct's fields from its own configuration. It makes one `Deploys` for the
-process (`Deploys::new(&config, &state_dir)`) as it starts and hands a clone
-to each server it serves the tools on (`McpServer::with_deploy`). One, not
-one per server: the caps are the process's, and making a second over a
-directory in use would clear the uploads and deploys of the first. Nothing
+struct's fields from its own configuration, at `McpConfig::deploy`. The
+server makes its deploy state under its state directory as it is
+built, and a second instance on the same origin is made from the first
+(`McpServer::sibling`), not built again: the caps hold per
+`McpServer::new` — per state directory — and are shared by its siblings,
+and a second server over a directory in use would clear the uploads and
+deploys of the first, so `McpServer::new` refuses one. Servers built by
+separate `McpServer::new` calls (another origin, over another state
+directory) each have caps of their own, so a process that runs several
+sizes them together. Nothing
 more is needed to run it — `spawn_session_reaper` starts the deploy sweeper
 and `shutdown` stops the running deploys — but an embedder that drains
-in-flight requests calls `Deploys::stop` *before* the drain, as the bundled
+in-flight requests calls `Deploys::stop` (on `McpServer::deploys`) *before* the drain, as the bundled
 binary does: a drain that began first would wait on deploys nothing had told
 to stop. After the drain, and before `shutdown` or exiting, it awaits
 `Deploys::stopped`: a bounded wait for each deploy to have ended, which a
-drain does not cover when a deploy's client has already gone. `Deploys::new`
-fails when another running server owns the state directory.
+drain does not cover when a deploy's client has already gone.
 
 ## Connect from an MCP client
 
@@ -770,8 +790,10 @@ cargo run
 # $MCP_DEPLOY_MAX_EXTRACTED_BYTES (default 128 MiB), and
 # $MCP_DEPLOY_MAX_STORED_BYTES of extracted bundles in all (default: one for
 # each deploy at once, and one more), and running the sync plugins it knows
-# plus those named in $MCP_DEPLOY_ALLOWED_PLUGINS; see "Deploying a project
-# bundle".
+# plus those named in $MCP_DEPLOY_ALLOWED_PLUGINS, each run held to
+# $MCP_DEPLOY_PLUGIN_MAX_MEMORY_BYTES, $MCP_DEPLOY_PLUGIN_MAX_COMPUTE_SECS and
+# $MCP_DEPLOY_PLUGIN_MAX_WALL_CLOCK_SECS (default: the icp CLI's 4 GiB, 60 s
+# and no wall-clock limit); see "Deploying a project bundle".
 ```
 
 The human-facing pages — the landing page and the `/privacy-policy`,

@@ -336,12 +336,13 @@ async fn registration_delegation_end_to_end() {
         instance: crate::IiInstance { name: "e2e", ii_url: gateway.to_string(), ii_canister: ii },
         public_url: public_url.into(),
         mcp_path: "/mcp".into(),
-        clients: crate::SharedClients::load(&state_dir),
         state_dir: state_dir.clone(),
         // The handshake under test carries no `resource`; keep it lenient.
         require_resource: false,
         cimd_enabled: false,
-    });
+        deploy: Default::default(),
+    })
+    .expect("a state directory of this test's own");
     let app = axum::Router::new()
         .nest_service(server.mcp_path(), server.mcp_router())
         .merge(server.well_known_router());

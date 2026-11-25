@@ -13,50 +13,40 @@ use tower::ServiceExt;
 
 const PUBLIC_URL: &str = "https://mcp.example.com";
 
-/// A throwaway operational-files directory for these tests, so they neither read
-/// nor write a developer's real `oauth-clients.json`. The authorize-path
-/// assertions rely on an EMPTY registration set (unknown/unregistered clients are
-/// rejected); a stray real registration for `client_id=unknown`/`x` would flip
-/// them, so the store file is cleared once. `SharedClients::load` treats a
-/// missing file as empty, giving a deterministic empty set. One fixed directory,
-/// shared by every `app()` in this binary.
-fn test_state_dir() -> std::path::PathBuf {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    let dir = std::env::temp_dir().join("imcp2-router-tests");
-    ONCE.call_once(|| {
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::remove_file(dir.join("oauth-clients.json")); // drop any stale file
-    });
-    dir
+/// The composed app, shaped like the STAGING deployment binary (which serves
+/// both instances): prod (the default instance, owning the root discovery
+/// documents and sharing the origin-global auth-callback allow-list) at `/mcp`,
+/// beta at `/mcp-beta`, a sibling of it. A production deployment serves `/mcp`
+/// alone; composing both here exercises the multi-instance routing contract.
+fn app() -> Router {
+    app_and_state_dir().0
 }
 
-fn server(instance: imcp2::IiInstance, mcp_path: &str) -> imcp2::McpServer {
-    let state_dir = test_state_dir();
+/// [`app`], and the operational-files directory it runs over: a throwaway
+/// one of its own, so the tests neither read nor write a developer's real
+/// `oauth-clients.json` nor share a directory, which a server owns alone.
+/// It starts empty — the authorize-path assertions rely on an EMPTY
+/// registration set (unknown/unregistered clients are rejected) — and is
+/// removed when the last clone of the app goes.
+fn app_and_state_dir() -> (Router, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("a state directory");
+    let state_dir = dir.path().to_path_buf();
     let agent = imcp2::Agent::builder().with_url(imcp2::IC_URL).build().expect("build agent");
-    imcp2::McpServer::new(imcp2::McpConfig {
+    let prod = imcp2::McpServer::new(imcp2::McpConfig {
         agent,
-        instance,
+        instance: imcp2::IiInstance::prod().expect("prod"),
         public_url: PUBLIC_URL.into(),
-        mcp_path: mcp_path.into(),
-        clients: imcp2::SharedClients::load(&state_dir),
-        state_dir,
+        mcp_path: "/mcp".into(),
+        state_dir: state_dir.clone(),
         // Lenient: these router contract tests drive flows that don't carry a
         // `resource`; strict RFC 8707 is covered by the auth unit tests.
         require_resource: false,
         cimd_enabled: false,
+        deploy: Default::default(),
     })
-}
-
-/// The composed app, shaped like the STAGING deployment binary (which serves
-/// both instances): prod (the default instance, owning the root discovery
-/// documents and sharing the origin-global auth-callback allow-list) at `/mcp`,
-/// beta at `/mcp-beta`. A production deployment serves `/mcp` alone; composing
-/// both here exercises the multi-instance routing contract.
-fn app() -> Router {
-    let prod = server(imcp2::IiInstance::prod().expect("prod"), "/mcp");
-    let beta = server(imcp2::IiInstance::beta().expect("beta"), "/mcp-beta");
-    Router::new()
+    .expect("a state directory of this app's own");
+    let beta = prod.sibling(imcp2::IiInstance::beta().expect("beta"), "/mcp-beta");
+    let app = Router::new()
         .nest_service(prod.mcp_path(), prod.mcp_router())
         .nest_service(beta.mcp_path(), beta.mcp_router())
         .merge(prod.well_known_router())
@@ -64,6 +54,9 @@ fn app() -> Router {
         .merge(prod.root_well_known_router())
         .merge(imcp2::auth_callbacks_router(&[&prod, &beta]))
         .merge(imcp2::ii_app_metadata_router())
+        // Carried by the app so the directory lasts as long as it does.
+        .layer(axum::Extension(std::sync::Arc::new(dir)));
+    (app, state_dir)
 }
 
 async fn get_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
@@ -224,7 +217,7 @@ async fn unauthenticated_mcp_requests_get_the_path_aware_challenge() {
 #[tokio::test]
 async fn dynamic_client_registration_round_trips_and_persists() {
     // One app, cloned per request, so both calls share the same client store.
-    let app = app();
+    let (app, state_dir) = app_and_state_dir();
     let register = |body: &'static str| {
         let app = app.clone();
         async move {
@@ -363,8 +356,8 @@ async fn dynamic_client_registration_round_trips_and_persists() {
 
     // Registrations are persisted (coalesced, so on a background task): poll
     // briefly for the write rather than assuming it has already landed. The store
-    // file is `{state_dir}/oauth-clients.json` (see `test_state_dir`).
-    let path = test_state_dir().join("oauth-clients.json");
+    // file is `{state_dir}/oauth-clients.json`.
+    let path = state_dir.join("oauth-clients.json");
     let mut persisted = String::new();
     for _ in 0..100 {
         persisted = std::fs::read_to_string(&path).unwrap_or_default();

@@ -94,7 +94,7 @@ impl Metrics {
     /// `version` and `commit` become the labels of a `build_info` gauge.
     ///
     /// With a server among `servers` that serves
-    /// the deploy tools ([`crate::McpServer::with_deploy`]), the deploy
+    /// the deploy tools ([`crate::McpConfig::deploy`]), the deploy
     /// series are registered too and fed from then on — the counters as
     /// deploys and uploads happen, the gauges by [`Self::refresh`]. Nothing
     /// more is asked of the caller. The deploy state reports to the first
@@ -198,7 +198,7 @@ impl Metrics {
         }
 
         // The deploy state is the process's, one whichever server names it.
-        let deploys = match servers.iter().find_map(|s| s.deploy.clone()) {
+        let deploys = match servers.first().map(|s| s.deploy.clone()) {
             Some(deploys) => {
                 let collectors = deploy::DeployMetrics::register(registry)?;
                 deploys.report_to(collectors.clone());
@@ -350,18 +350,23 @@ mod tests {
         (r, m)
     }
 
-    /// A real production-instance server. Construction is pure — no network.
-    fn server() -> crate::McpServer {
-        crate::McpServer::new(crate::McpConfig {
+    /// A real production-instance server, over a state directory of its own
+    /// that lasts as long as the handle returned with it. Construction
+    /// touches no network.
+    fn server() -> (tempfile::TempDir, crate::McpServer) {
+        let dir = tempfile::tempdir().unwrap();
+        let server = crate::McpServer::new(crate::McpConfig {
             agent: crate::Agent::builder().with_url(crate::IC_URL).build().expect("build agent"),
             instance: crate::IiInstance::prod().expect("prod instance"),
             public_url: "https://mcp.example.com".into(),
             mcp_path: "/mcp".into(),
-            clients: crate::SharedClients::load(std::env::temp_dir()),
-            state_dir: std::env::temp_dir(),
+            state_dir: dir.path().to_path_buf(),
             require_resource: true,
             cimd_enabled: false,
+            deploy: Default::default(),
         })
+        .unwrap();
+        (dir, server)
     }
 
     /// A router shaped like a host's. The cardinality tests drive real requests
@@ -535,7 +540,8 @@ mod tests {
     #[test]
     fn construction_zero_fills_served_instances() {
         let r = Registry::new();
-        let _m = Metrics::new(&r, "1.2.3", "abc1234", 0, &[&server()]).unwrap();
+        let (_dir, server) = server();
+        let _m = Metrics::new(&r, "1.2.3", "abc1234", 0, &[&server]).unwrap();
         let out = encode(&r);
         assert!(
             out.contains(concat!(metric!("live_sessions"), r#"{ii_instance="prod"} 0"#)),
@@ -553,7 +559,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_reads_through_to_a_server() {
         let r = Registry::new();
-        let m = Metrics::new(&r, "1.2.3", "abc1234", 0, &[&server()]).unwrap();
+        let (_dir, server) = server();
+        let m = Metrics::new(&r, "1.2.3", "abc1234", 0, &[&server]).unwrap();
         m.live_sessions.with_label_values(&["prod"]).set(99);
         m.active_sessions.with_label_values(&["prod"]).set(42);
         m.refresh().await;

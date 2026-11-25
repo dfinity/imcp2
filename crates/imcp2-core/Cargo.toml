@@ -59,7 +59,10 @@ tempfile = "3"
 # crates.io. The four share a workspace version upstream and are released
 # together: bump all four together.
 #
-# 0.1 has what the deploy tools are built on, dfinity/icp-cli#873 (on #868):
+# 0.2 adds dfinity/icp-cli#885, the memory, compute and wall-clock limits on
+# a sync plugin run that `PluginLimits` sets.
+#
+# 0.1 has the rest of what the deploy tools are built on, dfinity/icp-cli#873 (on #868):
 # #868 has `icp project bundle` write an archive of regular files and
 # directories alone, and #873 states the rule for an untrusted project
 # (`icp_project::untrusted`, what `--untrusted` on `icp build`, `deploy` and
@@ -74,10 +77,10 @@ tempfile = "3"
 #     brings wasmtime into every build of this crate.
 #   * icp-canister-interfaces: the engine-canister registry id a created
 #     canister's subnet is looked up in.
-icp-project = "0.1"
-icp-events = "0.1"
-icp-sync-plugin = "0.1"
-icp-canister-interfaces = "0.1"
+icp-project = "0.2"
+icp-events = "0.2"
+icp-sync-plugin = "0.2"
+icp-canister-interfaces = "0.2"
 
 # Only for the end-to-end canister-tool tests (src/e2e_canister_tools.rs),
 # behind the `e2e` feature so the default build compiles neither. `pocket-ic`

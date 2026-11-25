@@ -82,6 +82,7 @@ use std::{
     fmt,
     io::Read,
     sync::{Arc, Mutex, PoisonError},
+    time::Duration,
 };
 
 use crate::guard_candid_text;
@@ -255,14 +256,58 @@ impl Default for BundleLimits {
     }
 }
 
+/// What one run of a sync plugin is held to, for a server to set: a project
+/// cannot. Each is the icp CLI's own limit (`icp_sync_plugin::Limits`), and
+/// one left `None` is the CLI's default — which stops nothing a plugin does
+/// today, and is what a server on the user's own machine runs with.
+///
+/// A plugin runs inside the server's own process, as many at once as deploys
+/// do, so a server that deploys for others sizes these to what it has. The
+/// memory limit is linear memory alone: the runtime's own allocations for a
+/// run (compiling the plugin, its tables, host buffers) come on top of it,
+/// so leave headroom.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PluginLimits {
+    /// Linear memory, in bytes, summed across every memory the plugin has.
+    /// A growth past it is refused, as a wasm `memory.grow` that fails. The
+    /// CLI's default is 4 GiB, what one wasm32 memory can reach anyway.
+    pub memory_bytes: Option<u64>,
+    /// CPU time, in whole seconds: the time the plugin's wasm runs, with
+    /// what it spends waiting on a canister call given back. The CLI's
+    /// default is 60. A plugin waiting on the host is never charged, so
+    /// this alone does not bound a run; [`Self::wall_clock`] does.
+    pub compute_secs: Option<u64>,
+    /// How long one run may take from start to finish, canister calls and
+    /// anything else the plugin waits on included. The CLI's default is no
+    /// limit.
+    pub wall_clock: Option<Duration>,
+}
+
+impl PluginLimits {
+    /// These, as the runtime takes them.
+    fn runtime(&self) -> icp_sync_plugin::Limits {
+        let mut limits = icp_sync_plugin::Limits::default();
+        if let Some(bytes) = self.memory_bytes {
+            limits.memory_bytes = bytes;
+        }
+        if let Some(secs) = self.compute_secs {
+            limits.compute_secs = secs;
+        }
+        if let Some(wall_clock) = self.wall_clock {
+            limits.wall_clock = Some(wall_clock);
+        }
+        limits
+    }
+}
+
 /// The sync plugins a server that deploys for others runs unless it is told
 /// otherwise, each by the sha256 of its module and what it is.
 ///
 /// A sync plugin is a program the bundle brings and the server runs: it is
 /// held to a sandbox (WASI, its own deploy directory read-only, no network)
-/// and a compute budget, but not to a memory limit short of its address
-/// space, and it runs inside the server's own process. So a server whose
-/// bundles are not its user's own runs the plugins it knows, and no others.
+/// and to the limits the server sets ([`PluginLimits`]), but it runs inside
+/// the server's own process. So a server whose bundles are not its user's
+/// own runs the plugins it knows, and no others.
 /// A plugin is known by what it is — the hash of its bytes, which is also
 /// what `icp project bundle` records for it — never by the name or path the
 /// bundle gives it, which are the bundle's to choose.
@@ -381,16 +426,19 @@ pub async fn vet_plugins(
     if *plugins == AllowedPlugins::Any {
         return Ok(());
     }
-    let project = host_for(fs.clone(), limits).project.load().await.map_err(|e| {
-        let mut why = e.to_string();
-        let mut source = std::error::Error::source(&e);
-        while let Some(cause) = source {
-            why.push_str(": ");
-            why.push_str(&cause.to_string());
-            source = cause.source();
-        }
-        VetError::NotABundle(why)
-    })?;
+    let project =
+        host_for(fs.clone(), limits, PluginLimits::default()).project.load().await.map_err(
+            |e| {
+                let mut why = e.to_string();
+                let mut source = std::error::Error::source(&e);
+                while let Some(cause) = source {
+                    why.push_str(": ");
+                    why.push_str(&cause.to_string());
+                    source = cause.source();
+                }
+                VetError::NotABundle(why)
+            },
+        )?;
     // Each module is hashed once, however many canisters name it.
     let mut hashes: BTreeMap<Utf8PathBuf, String> = BTreeMap::new();
     for (dir, canister) in project.canisters.values() {
@@ -1076,24 +1124,23 @@ fn check_declared<'a>(
 /// the loader reads and retains — once per canister that names a file — stays
 /// within [`MAX_PROJECT_BYTES`]; the phases read the bundle itself.
 ///
-/// What is not bounded here: the sync-plugin runtime (`icp-sync-plugin`'s
-/// wasmtime runner) holds a plugin to a compute-time budget and a stack
-/// limit, and each of its linear memories to the wasm32 address space, but
-/// sets no store limiter, so a plugin may allocate up to that space before
-/// its time runs out. The runner builds its own engine and store, so the
-/// limiter belongs there, upstream; until it has one, a bundle's plugins run
-/// with the memory bound the icp CLI gives them — which is why a server that
-/// deploys for others runs only the plugins it knows ([`AllowedPlugins`]):
-/// what an unknown program might allocate is answered by not running it. Nor is the number of
-/// canisters or steps a manifest declares: the phases do their work once per
-/// canister, and each canister costs the caller the cycles that create it.
-pub fn host_for(fs: BundleFs, limits: &BundleLimits) -> Host {
-    host_within(fs, limits.project_bytes())
+/// Each sync plugin the deploy runs is held to `plugin_limits` by the
+/// runtime (`icp-sync-plugin`'s wasmtime runner): its memory, its CPU time
+/// and how long it may take. Left at the icp CLI's defaults, a plugin may
+/// allocate up to its address space — which is one reason a server that
+/// deploys for others also runs only the plugins it knows
+/// ([`AllowedPlugins`]).
+///
+/// What is not bounded here: the number of canisters or steps a manifest
+/// declares. The phases do their work once per canister, and each canister
+/// costs the caller the cycles that create it.
+pub fn host_for(fs: BundleFs, limits: &BundleLimits, plugin_limits: PluginLimits) -> Host {
+    host_within(fs, limits.project_bytes(), plugin_limits)
 }
 
 /// [`host_for`] with the project-loading budget as a parameter, so a test can
 /// reach it without a quarter of a gigabyte of argument files.
-fn host_within(fs: BundleFs, project_bytes: u64) -> Host {
+fn host_within(fs: BundleFs, project_bytes: u64, plugin_limits: PluginLimits) -> Host {
     // The directory IS the project root: no climbing to a workspace above it.
     let root = fs.root().to_path_buf();
     let locate: Arc<dyn ProjectRootLocate> =
@@ -1122,7 +1169,7 @@ fn host_within(fs: BundleFs, project_bytes: u64) -> Host {
         syncer: Arc::new(Syncer::new(
             Arc::new(NoScripts),
             wasm.clone(),
-            Arc::new(icp_sync_plugin::Wasmtime),
+            Arc::new(icp_sync_plugin::Wasmtime::new(plugin_limits.runtime())),
         )),
         wasm,
         network: Arc::new(IcMainnet),
@@ -1485,6 +1532,23 @@ impl<R: Read> Read for Limited<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a server sets reaches the runtime, and what it leaves unset is
+    /// the icp CLI's own default.
+    #[test]
+    fn plugin_limits_are_the_runtimes_unless_set() {
+        assert_eq!(PluginLimits::default().runtime(), icp_sync_plugin::Limits::default());
+        let set = PluginLimits {
+            memory_bytes: Some(256 << 20),
+            compute_secs: Some(30),
+            wall_clock: Some(Duration::from_secs(600)),
+        }
+        .runtime();
+        assert_eq!(set.memory_bytes, 256 << 20);
+        assert_eq!(set.compute_secs, 30);
+        assert_eq!(set.wall_clock, Some(Duration::from_secs(600)));
+        assert_eq!(set.table_elements, icp_sync_plugin::Limits::default().table_elements);
+    }
     use icp_project::{
         host::EnvironmentSelection,
         network::{Connected, Managed},
@@ -1720,7 +1784,7 @@ mod tests {
         let fs = extract_bundle(&bytes, &into).unwrap();
         symlink(&secret, into.join("out.wasm")).unwrap();
         let err = chain(
-            &host_for(fs.clone(), &BundleLimits::LOCAL)
+            &host_for(fs.clone(), &BundleLimits::LOCAL, PluginLimits::default())
                 .project
                 .load()
                 .await
@@ -1739,7 +1803,7 @@ mod tests {
         let fs = extract_bundle(&bytes, &into).unwrap();
         symlink("backend.wasm", into.join("in.wasm")).unwrap();
         let err = chain(
-            &host_for(fs.clone(), &BundleLimits::LOCAL)
+            &host_for(fs.clone(), &BundleLimits::LOCAL, PluginLimits::default())
                 .project
                 .load()
                 .await
@@ -1756,7 +1820,11 @@ mod tests {
         let fs = extract_bundle(&bytes, &into).unwrap();
         symlink(into.join("nowhere.wasm"), into.join("gone.wasm")).unwrap();
         let err = chain(
-            &host_for(fs, &BundleLimits::LOCAL).project.load().await.expect_err("a dangling link"),
+            &host_for(fs, &BundleLimits::LOCAL, PluginLimits::default())
+                .project
+                .load()
+                .await
+                .expect_err("a dangling link"),
         );
         assert!(err.contains("not a regular file in the project"), "{err}");
         assert!(err.contains("gone.wasm"), "{err}");
@@ -1774,7 +1842,11 @@ mod tests {
         let bytes = archive_with_dirs(&[("icp.yaml", manifest.as_bytes())], &["assets"]);
         let fs = extract_bundle(&bytes, &into).unwrap();
         let err = chain(
-            &host_for(fs, &BundleLimits::LOCAL).project.load().await.expect_err("a directory"),
+            &host_for(fs, &BundleLimits::LOCAL, PluginLimits::default())
+                .project
+                .load()
+                .await
+                .expect_err("a directory"),
         );
         assert!(err.contains("not a regular file"), "{err}");
         assert!(err.contains("assets"), "{err}");
@@ -1797,7 +1869,11 @@ mod tests {
         let fs = extract_bundle(&bytes, &alias).unwrap();
         assert_eq!(fs.root(), alias);
         assert!(into.join("backend.wasm").is_file());
-        let project = host_for(fs.clone(), &BundleLimits::LOCAL).project.load().await.unwrap();
+        let project = host_for(fs.clone(), &BundleLimits::LOCAL, PluginLimits::default())
+            .project
+            .load()
+            .await
+            .unwrap();
         assert_eq!(project.canisters.len(), 1);
         assert_eq!(fs.read(Utf8Path::new("backend.wasm")).await.unwrap(), b"\0asm");
         std::fs::remove_file(&alias).unwrap();
@@ -1838,7 +1914,7 @@ mod tests {
         ] {
             let (_dir, into) = scratch();
             let fs = extract_bundle(&archive(&[("icp.yaml", manifest.as_bytes())]), &into).unwrap();
-            let err = host_for(fs, &BundleLimits::LOCAL).project.load().await.expect_err(refused);
+            let err = host_for(fs, &BundleLimits::LOCAL, PluginLimits::default()).project.load().await.expect_err(refused);
             let err = chain(&err);
             assert!(err.contains(refused), "{refused}: {err}");
             // The refusal names the step, so the reader sees what was asked.
@@ -2212,7 +2288,7 @@ mod tests {
         // Room for the manifest and one read of the file, not two.
         let (_dir, into) = scratch();
         let fs = extract_bundle(&bytes, &into).unwrap();
-        let host = host_within(fs, manifest.len() as u64 + 1500);
+        let host = host_within(fs, manifest.len() as u64 + 1500, PluginLimits::default());
         let err = host.project.load().await.expect_err("the second read is over budget");
         let chain = std::iter::successors(Some(&err as &dyn std::error::Error), |e| e.source())
             .map(ToString::to_string)
@@ -2224,7 +2300,7 @@ mod tests {
         // Room for both.
         let (_dir, into) = scratch();
         let fs = extract_bundle(&bytes, &into).unwrap();
-        let host = host_within(fs, manifest.len() as u64 + 2000);
+        let host = host_within(fs, manifest.len() as u64 + 2000, PluginLimits::default());
         let project = host.project.load().await.unwrap();
         assert_eq!(project.canisters.len(), 2);
     }
@@ -2256,7 +2332,7 @@ mod tests {
     async fn environment(bytes: &[u8]) -> (tempfile::TempDir, BundleFs, Environment) {
         let (dir, into) = scratch();
         let fs = extract_bundle(bytes, &into).unwrap();
-        let env = host_for(fs.clone(), &BundleLimits::LOCAL)
+        let env = host_for(fs.clone(), &BundleLimits::LOCAL, PluginLimits::default())
             .get_environment(&EnvironmentSelection::Named("ic".into()))
             .await
             .unwrap();
@@ -2518,7 +2594,11 @@ mod tests {
             let (_dir, into) = scratch();
             let fs = extract_bundle(&bundle(declared), &into).unwrap();
             let err = chain(
-                &host_for(fs, &BundleLimits::LOCAL).project.load().await.expect_err(declared),
+                &host_for(fs, &BundleLimits::LOCAL, PluginLimits::default())
+                    .project
+                    .load()
+                    .await
+                    .expect_err(declared),
             );
             assert!(
                 err.contains("gives its sync plugin") && err.contains(named),

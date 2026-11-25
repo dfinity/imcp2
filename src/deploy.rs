@@ -1,5 +1,5 @@
-//! The deploy tools on the hosted server, for an embedder that turns them
-//! on ([`McpServer::with_deploy`]; the bundled binary always does): the
+//! The deploy tools on the hosted server, which every [`McpServer`] serves
+//! (configured at [`McpConfig::deploy`](crate::McpConfig::deploy)): the
 //! core surface served with [`imcp2_core::deploy`]'s tools beside it, a bundle
 //! upload route, and a transport that streams a deploy's progress and tells
 //! it when the client has gone.
@@ -40,15 +40,16 @@
 //!
 //! What a process shares across the endpoints it serves the tools at — the
 //! deploy slots, the upload store, the word that the server is stopping — is
-//! one [`Deploys`], made once and handed to each [`McpServer`]: the caps are
-//! on the process, whose memory and disk they protect. It also bounds what
-//! the directory holds over time (see [`Deploys::new`] and
-//! [`Deploys::spawn_sweeper`]).
+//! one [`Deploys`], made by [`McpServer::new`] and shared with every
+//! [`McpServer::sibling`]: the caps are on the process, whose memory and disk
+//! they protect. It also bounds what the directory holds over time (cleared
+//! as the server is made, and swept while it runs).
 //!
-//! An embedder turns the tools on by making one [`Deploys`] as the process
-//! starts and handing a clone to each server: everything it sets is a field
-//! of [`DeployConfig`] (no environment variable is read here), and the
-//! sweeper starts with [`McpServer::spawn_session_reaper`].
+//! An embedder configures the tools with its server: everything
+//! it sets is a field of [`DeployConfig`], at
+//! [`McpConfig::deploy`](crate::McpConfig::deploy) (no environment variable
+//! is read here), and the sweeper starts with
+//! [`McpServer::spawn_session_reaper`].
 //!
 //! Stopping is the one thing to get in the right order. An embedder that
 //! drains in-flight requests calls [`Deploys::stop`] *before* the drain: a
@@ -66,13 +67,14 @@
 //! #     config: imcp2::McpConfig,
 //! #     signal: impl std::future::Future<Output = ()>,
 //! # ) -> std::io::Result<()> {
-//! use imcp2::deploy::{DeployConfig, Deploys};
+//! use imcp2::deploy::DeployConfig;
 //!
-//! // Once per process, over the state directory the servers share. An
-//! // error is a state directory another running server owns.
-//! let config_for_deploys = DeployConfig { concurrent: 1, ..Default::default() };
-//! let deploys = Deploys::new(&config_for_deploys, &config.state_dir)?;
-//! let server = imcp2::McpServer::new(config).with_deploy(deploys.clone());
+//! // An error is a state directory another running server owns.
+//! let server = imcp2::McpServer::new(imcp2::McpConfig {
+//!     deploy: DeployConfig { concurrent: 1, ..Default::default() },
+//!     ..config
+//! })?;
+//! let deploys = server.deploys().clone();
 //! server.spawn_session_reaper(); // the deploy sweeper with it
 //! // ... serve `server.mcp_router()` ...
 //! signal.await;
@@ -110,6 +112,9 @@ use rmcp::transport::{
     StreamableHttpServerConfig,
 };
 use tokio_util::sync::CancellationToken;
+
+/// What a sync plugin run is held to; see [`DeployConfig::plugin_limits`].
+pub use imcp2_core::deploy::PluginLimits;
 
 use crate::{
     auth,
@@ -163,11 +168,21 @@ pub struct DeployConfig {
     /// upload, and again by the deploy. Adding a hash here is vouching for
     /// that program.
     pub allowed_plugins: Vec<String>,
+    /// What each run of a sync plugin is held to — its linear memory, its
+    /// CPU time and how long it may take from start to finish — where the
+    /// default leaves each at the icp CLI's own: 4 GiB, 60 seconds of
+    /// compute, and no limit on the run as a whole. A plugin runs inside
+    /// the server's process, one for each deploy at once
+    /// ([`Self::concurrent`]), so the memory limit times that is the linear
+    /// memory plugins of this server and its siblings can take together.
+    /// The runtime's own allocations for a run (compiling the plugin, its
+    /// tables, host buffers) come on top of it: leave headroom.
+    pub plugin_limits: PluginLimits,
 }
 
 impl Default for DeployConfig {
-    /// Two deploys at once, archives of 64 MiB, bundles of 128 MiB, and
-    /// three of those in all.
+    /// Two deploys at once, archives of 64 MiB, bundles of 128 MiB, three
+    /// of those in all, and sync plugins held to the icp CLI's own limits.
     fn default() -> Self {
         Self {
             concurrent: 2,
@@ -175,6 +190,7 @@ impl Default for DeployConfig {
             max_extracted_bytes: imcp2_core::deploy::DEFAULT_MAX_EXTRACTED_BYTES,
             max_stored_bytes: None,
             allowed_plugins: Vec::new(),
+            plugin_limits: PluginLimits::default(),
         }
     }
 }
@@ -207,14 +223,19 @@ pub const DEPLOY_RECORD_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// How often the sweeper looks for what has lapsed.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
-/// What a process's deploy endpoints share: the slots deploys run in, the
+/// What a server's deploy endpoints share: the slots deploys run in, the
 /// store uploads are received into, and the word that the server is
-/// stopping. Cheap to clone; made once per process and handed to every
-/// [`McpServer`] that serves the tools ([`McpServer::with_deploy`]).
+/// stopping. Cheap to clone; made once per state directory, by
+/// [`McpServer::new`] from [`crate::McpConfig::deploy`], and shared with the
+/// server's siblings, so its caps hold across them — but not across servers
+/// built by separate `new` calls, each of which has its own. An embedder
+/// reaches it at [`McpServer::deploys`].
 #[derive(Clone)]
 pub struct Deploys {
     slots: DeploySlots,
     uploads: Uploads,
+    /// What each sync plugin run is held to.
+    plugin_limits: PluginLimits,
     /// `{state_dir}/deploys`: each deploy's working directory, and `uploads`.
     dir: std::path::PathBuf,
     stopping: CancellationToken,
@@ -260,8 +281,8 @@ const LOCK_FILE: &str = ".lock";
 const STOP_MARGIN: Duration = Duration::from_secs(5);
 
 impl Deploys {
-    /// The deploy state under `state_dir` — the state directory of every
-    /// [`McpServer`] this is handed to — as `config` bounds it.
+    /// The deploy state under `state_dir` — the state directory of the
+    /// [`McpServer`] it is made for — as `config` bounds it.
     ///
     /// Made as the process starts, before a deploy runs, it clears what an
     /// earlier process left: uploads nothing can deploy any more are removed,
@@ -278,7 +299,7 @@ impl Deploys {
     /// not a sha256 (a list read wrong is not run with), and a state
     /// directory whose path is not UTF-8, which the deploy tools could not
     /// work in.
-    pub fn new(config: &DeployConfig, state_dir: &Path) -> std::io::Result<Self> {
+    pub(crate) fn new(config: &DeployConfig, state_dir: &Path) -> std::io::Result<Self> {
         let plugins = imcp2_core::deploy::AllowedPlugins::known_and(&config.allowed_plugins)
             .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
         let dir = state_dir.join("deploys");
@@ -311,12 +332,20 @@ impl Deploys {
         Ok(Self {
             slots: DeploySlots::new(config.concurrent),
             uploads,
+            plugin_limits: config.plugin_limits,
             dir,
             stopping: CancellationToken::new(),
             _owned: owned,
             sweeping: Arc::default(),
             metrics: Reporting::default(),
         })
+    }
+
+    /// The lock on the state directory this owns, for what else keeps
+    /// files there (the client registrations) to hold it as long as it
+    /// writes them.
+    pub(crate) fn owner(&self) -> Arc<std::fs::File> {
+        self._owned.clone()
     }
 
     /// Wait for the deploys that were running at [`Self::stop`] to have
@@ -476,24 +505,31 @@ impl McpServer {
     /// bearer gate, and the upload route, which goes outside it (the ticket
     /// is its authentication). `transport` is the endpoint's configuration
     /// as the plain endpoint would use it.
-    pub(crate) fn deploy_mcp_routers(
-        &self,
-        deploys: &Deploys,
-        transport: StreamableHttpServerConfig,
-    ) -> (Router, Router) {
-        let uploads = deploys.uploads.clone();
+    /// The deploy tools this endpoint serves, over `deploys`.
+    fn deploy_tools(&self, deploys: &Deploys) -> IcDeployTools {
         let upload_url = format!("{}{}{UPLOAD_PATH}", self.public_url, self.mcp_path);
-        // The slots, the store and the stop are the process's, shared with
-        // every other endpoint and every router built from this server.
-        let deploy = IcDeployTools::new(self.identities.clone(), auth::bearer_session_resolver())
+        // The slots, the store and the stop are this state directory's,
+        // shared with every other endpoint and every router built from this
+        // server.
+        IcDeployTools::new(self.identities.clone(), auth::bearer_session_resolver())
             .with_slots(deploys.slots.clone())
             .stopped_by(deploys.stopping.clone())
             .deploys_in(&deploys.dir)
             // `Deploys::new` made the directory and refused a path that is
             // not UTF-8, which is all this can fail on.
             .unwrap_or_else(|e| panic!("the deploy directory, checked as it was made: {e}"))
-            .with_uploads(uploads.clone(), upload_url)
-            .observed_by(Arc::new(deploys.metrics.clone()));
+            .with_uploads(deploys.uploads.clone(), upload_url)
+            .with_plugin_limits(deploys.plugin_limits)
+            .observed_by(Arc::new(deploys.metrics.clone()))
+    }
+
+    pub(crate) fn deploy_mcp_routers(
+        &self,
+        deploys: &Deploys,
+        transport: StreamableHttpServerConfig,
+    ) -> (Router, Router) {
+        let uploads = deploys.uploads.clone();
+        let deploy = self.deploy_tools(deploys);
         let service = |transport: StreamableHttpServerConfig| {
             let (agent, identities, deploy) =
                 (self.agent.clone(), self.identities.clone(), deploy.clone());
@@ -776,7 +812,7 @@ async fn upload(State(mcp): State<Arc<DeployMcp>>, request: Request) -> Response
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Agent, IiInstance, McpConfig, SharedClients, IC_URL};
+    use crate::{Agent, IiInstance, McpConfig, IC_URL};
     use axum::http::Request;
     use tower::ServiceExt;
 
@@ -787,6 +823,7 @@ mod tests {
             max_extracted_bytes: 64 * 1024,
             max_stored_bytes: None,
             allowed_plugins: Vec::new(),
+            plugin_limits: PluginLimits::default(),
         }
     }
 
@@ -839,29 +876,63 @@ mod tests {
 
     fn server() -> (tempfile::TempDir, McpServer) {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys);
+        let server = server_in(dir.path());
         (dir, server)
     }
 
-    fn server_in(state_dir: &Path, mcp_path: &str, deploys: Deploys) -> McpServer {
-        server_at(state_dir, mcp_path, deploys, IC_URL)
+    /// A server at `/mcp` over `state_dir`, which must be free.
+    fn server_in(state_dir: &Path) -> McpServer {
+        server_at(state_dir, IC_URL).unwrap()
     }
 
-    /// [`server_in`], with the IC endpoint the server calls at `ic_url`.
-    fn server_at(state_dir: &Path, mcp_path: &str, deploys: Deploys, ic_url: &str) -> McpServer {
-        let state_dir = state_dir.to_path_buf();
+    /// A server at `/mcp` over `state_dir` that calls the IC at `ic_url`, or
+    /// why there is none: the directory is another server's.
+    fn server_at(state_dir: &Path, ic_url: &str) -> std::io::Result<McpServer> {
         McpServer::new(McpConfig {
             agent: Agent::builder().with_url(ic_url).build().expect("agent"),
             instance: IiInstance::prod().expect("prod instance"),
             public_url: "https://mcp.example.com".into(),
-            mcp_path: mcp_path.into(),
-            clients: SharedClients::load(&state_dir),
-            state_dir,
+            mcp_path: "/mcp".into(),
+            state_dir: state_dir.to_path_buf(),
             require_resource: true,
             cimd_enabled: false,
+            deploy: config(),
         })
-        .with_deploy(deploys)
+    }
+
+    /// The sync-plugin limits a server is configured with are what the
+    /// deploy tools of each of its endpoints hold a plugin to, not the icp
+    /// CLI's defaults.
+    #[test]
+    fn the_configured_plugin_limits_reach_the_deploy_tools() {
+        let limits = PluginLimits {
+            memory_bytes: Some(256 << 20),
+            compute_secs: Some(7),
+            wall_clock: Some(Duration::from_secs(90)),
+        };
+        assert_ne!(limits, PluginLimits::default());
+        let dir = tempfile::tempdir().unwrap();
+        let server = McpServer::new(McpConfig {
+            agent: Agent::builder().with_url(IC_URL).build().expect("agent"),
+            instance: IiInstance::prod().expect("prod instance"),
+            public_url: "https://mcp.example.com".into(),
+            mcp_path: "/mcp".into(),
+            state_dir: dir.path().to_path_buf(),
+            require_resource: true,
+            cimd_enabled: false,
+            deploy: DeployConfig { plugin_limits: limits, ..config() },
+        })
+        .unwrap();
+        let beta = beside(&server);
+        for endpoint in [&server, &beta] {
+            assert_eq!(endpoint.deploy_tools(endpoint.deploys()).plugin_limits(), limits);
+        }
+    }
+
+    /// A second endpoint of `server`'s process, at `/mcp-beta`: the same
+    /// Internet Identity, so that only the path differs.
+    fn beside(server: &McpServer) -> McpServer {
+        server.sibling(IiInstance::prod().expect("prod instance"), "/mcp-beta")
     }
 
     fn rpc(method: &str, params: serde_json::Value) -> String {
@@ -1089,9 +1160,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_endpoints_of_a_process_share_its_deploy_state() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let prod = server_in(dir.path(), "/mcp", deploys.clone());
-        let beta = server_in(dir.path(), "/mcp-beta", deploys.clone());
+        let prod = server_in(dir.path());
+        let deploys = prod.deploys().clone();
+        let beta = beside(&prod);
         let bearer = format!("Bearer {}", prod.store.test_bearer().await);
         let (app, again) = (prod.mcp_router(), prod.mcp_router());
 
@@ -1133,8 +1204,8 @@ mod tests {
     async fn deploys_and_uploads_are_counted() {
         use prometheus::{Encoder, Registry, TextEncoder};
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let server = server_in(dir.path());
+        let deploys = server.deploys().clone();
         let registry = Registry::new();
         let metrics = crate::metrics::Metrics::new(&registry, "0", "0", 0, &[&server]).unwrap();
         let scrape = || {
@@ -1304,8 +1375,8 @@ mod tests {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let ic_url = format!("http://{}", silent.local_addr().unwrap());
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_at(dir.path(), "/mcp", deploys.clone(), &ic_url);
+        let server = server_at(dir.path(), &ic_url).unwrap();
+        let deploys = server.deploys().clone();
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let app = server.mcp_router();
 
@@ -1377,8 +1448,7 @@ mod tests {
     async fn the_dispatch_reads_what_the_endpoints_cap_allows() {
         const MIB: usize = 1024 * 1024;
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys).with_max_request_body(6 * MIB);
+        let server = server_in(dir.path()).with_max_request_body(6 * MIB);
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let app = server.mcp_router();
         let padded = |bytes: usize| {
@@ -1421,8 +1491,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stopping_server_takes_no_upload() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let server = server_in(dir.path());
+        let deploys = server.deploys().clone();
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let app = server.mcp_router();
         let ticket = ticket(&app, &bearer).await;
@@ -1439,8 +1509,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stopping_server_begins_no_deploy() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let server = server_in(dir.path());
+        let deploys = server.deploys().clone();
         let bearer = format!("Bearer {}", server.store.test_bearer().await);
         let app = server.mcp_router();
         deploys.stop();
@@ -1460,9 +1530,9 @@ mod tests {
     #[tokio::test]
     async fn the_servers_own_lifecycle_runs_the_deploy_state() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let prod = server_in(dir.path(), "/mcp", deploys.clone());
-        let beta = server_in(dir.path(), "/mcp-beta", deploys.clone());
+        let prod = server_in(dir.path());
+        let deploys = prod.deploys().clone();
+        let beta = beside(&prod);
         // Counted in tasks: nothing here yields, so on this one-thread
         // runtime every task spawned is still alive when it is counted.
         let tasks = || tokio::runtime::Handle::current().metrics().num_alive_tasks();
@@ -1506,35 +1576,37 @@ mod tests {
     #[test]
     fn a_state_directory_has_one_server_at_a_time() {
         let dir = tempfile::tempdir().unwrap();
-        let first = Deploys::new(&config(), dir.path()).unwrap();
+        let first = server_in(dir.path());
         let upload = dir.path().join("deploys/uploads").join(format!("{}.tar.gz", "a".repeat(64)));
         std::fs::write(&upload, "the first server's upload").unwrap();
 
-        let Err(refused) = Deploys::new(&config(), dir.path()) else {
+        let Err(refused) = server_at(dir.path(), IC_URL) else {
             panic!("a second server took a directory in use");
         };
         assert!(refused.to_string().contains("another running server"), "{refused}");
         assert!(upload.exists(), "the first server's upload is untouched");
 
-        // A clone is the same server, and so is a router made from it, which
-        // goes on serving after the handles it was made from have gone: the
-        // directory is free once the last of them has.
-        let clone = first.clone();
-        let router = server_in(dir.path(), "/mcp", first.clone()).mcp_router();
+        // A clone is the same server, and so are a sibling and a router made
+        // from it, which go on serving after the handles they were made from
+        // have gone: the directory is free once the last of them has.
+        let (clone, sibling) = (first.clone(), beside(&first));
+        let router = first.mcp_router();
         drop(first);
-        assert!(Deploys::new(&config(), dir.path()).is_err());
+        assert!(server_at(dir.path(), IC_URL).is_err());
         drop(clone);
-        assert!(Deploys::new(&config(), dir.path()).is_err(), "a router is still serving");
+        assert!(server_at(dir.path(), IC_URL).is_err(), "a sibling is still serving");
+        drop(sibling);
+        assert!(server_at(dir.path(), IC_URL).is_err(), "a router is still serving");
         drop(router);
-        Deploys::new(&config(), dir.path()).unwrap();
+        server_at(dir.path(), IC_URL).unwrap();
     }
 
     /// A stopping server waits for the deploy that is still ending.
     #[tokio::test(start_paused = true)]
     async fn a_stopping_server_waits_for_its_deploys_to_end() {
         let dir = tempfile::tempdir().unwrap();
-        let deploys = Deploys::new(&config(), dir.path()).unwrap();
-        let server = server_in(dir.path(), "/mcp", deploys.clone());
+        let server = server_in(dir.path());
+        let deploys = server.deploys().clone();
         let tools = IcDeployTools::new(server.identities.clone(), Arc::new(|_: &_| None))
             .with_slots(deploys.slots.clone());
         assert!(deploys.stopped().await, "nothing is running");

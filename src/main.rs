@@ -30,8 +30,7 @@
 
 use axum::{routing::get, Json, Router};
 use imcp2::{
-    auth_callbacks_router, ii_app_metadata_router, Agent, IiInstance, McpConfig, McpServer,
-    SharedClients, IC_URL,
+    auth_callbacks_router, ii_app_metadata_router, Agent, IiInstance, McpConfig, McpServer, IC_URL,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -96,29 +95,85 @@ fn require_resource() -> bool {
 ///     more);
 ///   * `$MCP_DEPLOY_ALLOWED_PLUGINS`, the sha256 of each sync plugin the
 ///     server runs besides the ones it knows, in hex, separated by commas or
-///     spaces (default: none besides).
+///     spaces (default: none besides);
+///   * `$MCP_DEPLOY_PLUGIN_MAX_MEMORY_BYTES`, `$MCP_DEPLOY_PLUGIN_MAX_COMPUTE_SECS`
+///     and `$MCP_DEPLOY_PLUGIN_MAX_WALL_CLOCK_SECS`, what each run of a sync
+///     plugin is held to: its memory, its CPU time, and how long it may take
+///     in all (default: the icp CLI's own, which are 4 GiB, 60 seconds and
+///     no limit). Zero is refused: it would run no plugin.
 ///
-/// A value that is not a whole number refuses to start, and so does one
-/// that contradicts another rather than being quietly bent to fit: a count
-/// of zero (the tools run at least one deploy), an archive cap over what a
-/// bundle may extract to (an archive is never larger than its contents),
-/// and a store too small for one bundle.
+/// A blank value (`NAME=`) reads as unset, as [`max_request_body_from`]
+/// reads its own. A value that is not Unicode refuses to start, naming the
+/// variable, rather than being read as unset; so does one that is not a
+/// whole number, and one that contradicts another rather than being
+/// quietly bent to fit: a count of zero (the tools run at least one
+/// deploy), an archive cap over what a bundle may extract to (an archive
+/// is never larger than its contents), and a store too small for one
+/// bundle.
 fn deploy_config() -> anyhow::Result<imcp2::deploy::DeployConfig> {
-    let var = |name: &str| std::env::var(name).ok();
-    deploy_config_from([
-        var("MCP_DEPLOY_MAX_CONCURRENT").as_deref(),
-        var("MCP_DEPLOY_MAX_UPLOAD_BYTES").as_deref(),
-        var("MCP_DEPLOY_MAX_EXTRACTED_BYTES").as_deref(),
-        var("MCP_DEPLOY_MAX_STORED_BYTES").as_deref(),
-    ])
-    .map(|config| imcp2::deploy::DeployConfig {
-        allowed_plugins: allowed_plugins(var("MCP_DEPLOY_ALLOWED_PLUGINS").as_deref()),
+    let var = |name: &str| deploy_var(name, std::env::var(name));
+    let config = deploy_config_from([
+        var("MCP_DEPLOY_MAX_CONCURRENT")?.as_deref(),
+        var("MCP_DEPLOY_MAX_UPLOAD_BYTES")?.as_deref(),
+        var("MCP_DEPLOY_MAX_EXTRACTED_BYTES")?.as_deref(),
+        var("MCP_DEPLOY_MAX_STORED_BYTES")?.as_deref(),
+    ])?;
+    Ok(imcp2::deploy::DeployConfig {
+        allowed_plugins: allowed_plugins(var("MCP_DEPLOY_ALLOWED_PLUGINS")?.as_deref()),
+        plugin_limits: plugin_limits_from([
+            var("MCP_DEPLOY_PLUGIN_MAX_MEMORY_BYTES")?.as_deref(),
+            var("MCP_DEPLOY_PLUGIN_MAX_COMPUTE_SECS")?.as_deref(),
+            var("MCP_DEPLOY_PLUGIN_MAX_WALL_CLOCK_SECS")?.as_deref(),
+        ])?,
         ..config
     })
 }
 
+/// One `$MCP_DEPLOY_*` variable's value (`name`'s, as `std::env::var` read
+/// it): `None` when it is unset or blank — the native deploy renders a
+/// variable nobody set as `NAME=` (see [`max_request_body_from`]) — and an
+/// error naming it when it is not Unicode, which is a value set wrong, not
+/// one left unset.
+fn deploy_var(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+) -> anyhow::Result<Option<String>> {
+    use std::env::VarError;
+    match value {
+        Ok(v) if v.trim().is_empty() => Ok(None),
+        Ok(v) => Ok(Some(v)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(raw)) => {
+            Err(anyhow::anyhow!("{name} is not valid UTF-8: {raw:?}"))
+        }
+    }
+}
+
+/// The three `$MCP_DEPLOY_PLUGIN_MAX_*` variables' values, in the order
+/// memory, compute, wall clock, as the limits a sync plugin runs under. One
+/// that is unset leaves the icp CLI's default.
+fn plugin_limits_from(
+    [memory_bytes, compute_secs, wall_clock_secs]: [Option<&str>; 3],
+) -> anyhow::Result<imcp2::deploy::PluginLimits> {
+    let positive = |name: &str, value: Option<&str>| -> anyhow::Result<Option<u64>> {
+        let Some(value) = value else { return Ok(None) };
+        let n: u64 = value
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{name} must be a whole number: {e}"))?;
+        anyhow::ensure!(n > 0, "{name} must be at least 1: at zero no sync plugin could run");
+        Ok(Some(n))
+    };
+    Ok(imcp2::deploy::PluginLimits {
+        memory_bytes: positive("MCP_DEPLOY_PLUGIN_MAX_MEMORY_BYTES", memory_bytes)?,
+        compute_secs: positive("MCP_DEPLOY_PLUGIN_MAX_COMPUTE_SECS", compute_secs)?,
+        wall_clock: positive("MCP_DEPLOY_PLUGIN_MAX_WALL_CLOCK_SECS", wall_clock_secs)?
+            .map(std::time::Duration::from_secs),
+    })
+}
+
 /// `$MCP_DEPLOY_ALLOWED_PLUGINS` as its entries. Whether each is a sha256 is
-/// for [`imcp2::deploy::Deploys::new`] to say, which refuses to start on one
+/// for [`McpServer::new`] to say, which refuses to start on one
 /// that is not: a list misread is a plugin wrongly refused, or wrongly run.
 fn allowed_plugins(value: Option<&str>) -> Vec<String> {
     value
@@ -442,20 +497,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("built ic-agent against {IC_URL}");
     let public_url = public_url();
 
-    // The directory all operational files live in (the client-registration
-    // store today). One place, injected into every instance's McpConfig.
-    let state_dir = state_dir();
-
-    // Dynamic client registrations are II-agnostic (redirect allow-list only),
-    // so all instances share one store (and one persisted snapshot), loaded from
-    // the operational directory.
-    let clients = SharedClients::load(&state_dir);
-
-    // The deploy tools, on every instance: one set of slots
-    // and one upload store for the process, so the caps hold across the
-    // instances. Making it clears what the run before left behind; its
-    // sweeper starts with the first instance's session reaper.
-    let deploys = imcp2::deploy::Deploys::new(&deploy_config()?, &state_dir)?;
     // One request-body cap for every instance (see `max_request_body`).
     let max_request_body = max_request_body()?;
 
@@ -466,37 +507,31 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Production Internet Identity at `/mcp`: always served, and the origin's
-    // default instance (it answers the plain-root discovery probes). A
-    // self-contained McpServer whose sessions/tokens never cross instances.
+    // default instance (it answers the plain-root discovery probes). It is
+    // built over the directory all operational files live in, with the
+    // deploy tools on: making it clears what the run before left behind.
     let prod = McpServer::new(McpConfig {
-        agent: agent.clone(),
+        agent,
         instance: IiInstance::prod().map_err(anyhow::Error::msg)?,
         public_url: public_url.clone(),
         mcp_path: "/mcp".into(),
-        clients: clients.clone(),
-        state_dir: state_dir.clone(),
+        state_dir: state_dir(),
         require_resource: require_resource(),
         cimd_enabled: cimd_on,
-    })
+        deploy: deploy_config()?,
+    })?
     .with_max_request_body(max_request_body);
-    let prod = prod.with_deploy(deploys.clone());
     prod.spawn_session_reaper();
+    // The process's deploy state, for the shutdown below to stop.
+    let deploys = prod.deploys().clone();
 
     // Beta Internet Identity at `/mcp-beta`: opt in via `$MCP_SERVE_BETA`, so
     // only the staging deployment exposes it; production serves `/mcp` alone.
+    // A sibling of the production instance: sessions and tokens never cross
+    // the two, while the client registrations (II-agnostic) and the deploy
+    // tools' slots and upload store are the process's, shared by both.
     let beta = if serve_beta() {
-        let beta = McpServer::new(McpConfig {
-            agent,
-            instance: IiInstance::beta().map_err(anyhow::Error::msg)?,
-            public_url: public_url.clone(),
-            mcp_path: "/mcp-beta".into(),
-            clients,
-            state_dir,
-            require_resource: require_resource(),
-            cimd_enabled: cimd_on,
-        })
-        .with_max_request_body(max_request_body);
-        let beta = beta.with_deploy(deploys.clone());
+        let beta = prod.sibling(IiInstance::beta().map_err(anyhow::Error::msg)?, "/mcp-beta");
         beta.spawn_session_reaper();
         Some(beta)
     } else {
@@ -790,6 +825,26 @@ mod tests {
         assert!(super::deploy_config_from([None, None, Some("-1"), None]).is_err());
     }
 
+    /// What a sync plugin is held to is the icp CLI's own unless set, and a
+    /// value that would run no plugin, or is no number, refuses to start.
+    #[test]
+    fn plugin_limits_are_read_from_the_environment() {
+        use imcp2::deploy::PluginLimits;
+        assert_eq!(super::plugin_limits_from([None; 3]).unwrap(), PluginLimits::default());
+        let set = super::plugin_limits_from([Some("536870912"), Some(" 30 "), Some("600")]);
+        assert_eq!(
+            set.unwrap(),
+            PluginLimits {
+                memory_bytes: Some(512 << 20),
+                compute_secs: Some(30),
+                wall_clock: Some(std::time::Duration::from_secs(600)),
+            }
+        );
+        assert!(super::plugin_limits_from([Some("0"), None, None]).is_err());
+        assert!(super::plugin_limits_from([None, Some("soon"), None]).is_err());
+        assert!(super::plugin_limits_from([None, None, Some("-1")]).is_err());
+    }
+
     /// The plugins an operator adds are a list, however it is punctuated,
     /// and one that is not a hash stops the server from starting.
     #[test]
@@ -800,15 +855,49 @@ mod tests {
         let listed = super::allowed_plugins(Some(&format!(" {a},{b}\n{a} ")));
         assert_eq!(listed, [a.clone(), b, a]);
 
+        use super::{Agent, IiInstance, McpConfig, McpServer, IC_URL};
         let dir = tempfile::tempdir().unwrap();
-        let config =
-            |allowed_plugins| imcp2::deploy::DeployConfig { allowed_plugins, ..Default::default() };
-        let Err(refused) = imcp2::deploy::Deploys::new(&config(vec!["nope".into()]), dir.path())
-        else {
+        let server = |allowed_plugins| {
+            McpServer::new(McpConfig {
+                agent: Agent::builder().with_url(IC_URL).build().unwrap(),
+                instance: IiInstance::prod().unwrap(),
+                public_url: "https://mcp.example.com".into(),
+                mcp_path: "/mcp".into(),
+                state_dir: dir.path().to_path_buf(),
+                require_resource: true,
+                cimd_enabled: true,
+                deploy: imcp2::deploy::DeployConfig { allowed_plugins, ..Default::default() },
+            })
+        };
+        let Err(refused) = server(vec!["nope".into()]) else {
             panic!("a server started with a plugin list it could not read");
         };
         assert!(refused.to_string().contains("not the sha256 of a plugin"), "{refused}");
-        imcp2::deploy::Deploys::new(&config(listed), dir.path()).unwrap();
+        server(listed).unwrap();
+    }
+
+    /// A `$MCP_DEPLOY_*` variable that is blank reads as unset, as one that
+    /// is absent does; one that is not Unicode is refused, naming it, and
+    /// not mistaken for one that is absent.
+    #[test]
+    fn a_deploy_variable_blank_is_unset_and_not_unicode_is_refused() {
+        use super::deploy_var;
+        use std::env::VarError;
+        let name = "MCP_DEPLOY_PLUGIN_MAX_MEMORY_BYTES";
+        assert_eq!(deploy_var(name, Err(VarError::NotPresent)).unwrap(), None);
+        for blank in ["", " ", "\t", " \n"] {
+            assert_eq!(deploy_var(name, Ok(blank.into())).unwrap(), None, "{blank:?}");
+        }
+        assert_eq!(deploy_var(name, Ok(" 12 ".into())).unwrap().as_deref(), Some(" 12 "));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = std::ffi::OsString::from_vec(vec![b'1', b'2', 0xff]);
+            let err = deploy_var(name, Err(VarError::NotUnicode(raw)))
+                .expect_err("a value that is not Unicode is not an unset one");
+            assert!(err.to_string().contains(name), "{err}");
+        }
     }
 
     /// The deploy cap is a count of at least one: zero is refused at startup
