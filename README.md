@@ -1273,8 +1273,9 @@ without opaque low-level errors:
   missing or unrecognized value leaves the level **unknown** (not assumed
   writable): the update is attempted and the IC's ingress rejection is the
   fallback signal.
-- Management tools check it up front and, for a *known* read-only session, return
-  an actionable *"reconnect with read-only off"* message instead of an ingress error.
+- The deploy tools (`icp_deploy`, `icp_deploy_upload`) check it up front and, for a
+  *known* read-only session, return an actionable *"reconnect under Actions &
+  questions"* message instead of an ingress error.
 - `get_app_principal` reflects a read-only session in its output, so the agent won't
   attempt updates it can't make.
 
