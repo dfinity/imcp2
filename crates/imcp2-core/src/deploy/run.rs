@@ -721,7 +721,7 @@ fn insufficient_cycles(deploy_principal: Principal, cycles: u128, ended: &str) -
          deploys as, principal {deploy_principal}, does not have enough cycles. Each new \
          canister is funded with {cycles} cycles from that identity's cycles balance. Tell the \
          user, in these words or close to them: \"Your identity \
-         needs more cycles before this app can be deployed. You can buy cycles by card with \
+         needs more cycles before this app can be deployed. You can fund future with \
          CyclePay at {CYCLEPAY_URL}{deploy_principal} — let me know once the payment has gone \
          through and I'll deploy again.\" Do not retry until the user confirms they have paid. \
          Then deploy again with the same bundle and with the `canister_ids` returned here \
