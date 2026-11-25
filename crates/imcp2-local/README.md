@@ -172,12 +172,14 @@ canister-id mapping — pass it back next time to upgrade — the canisters
 created, and a log of each phase. A failed or interrupted deploy still reports
 every canister it created before that, so the run can be picked up rather than
 repeated. A deploy that fails because the deploy account cannot pay for a new
-canister says so with an error starting `NOT ENOUGH CYCLES`: it says what the
-funds needed are estimated at, $3 for each canister still to be created, and
-gives a [CyclePay](https://www.cyclepay.org) link that buys cycles by card for
-that account's principal and that amount
+canister says so with an error starting `NOT ENOUGH CYCLES`: it says how many
+cycles the canisters still to be created need, and gives a
+[CyclePay](https://www.cyclepay.org) link that buys them by card for that
+account's principal
 (`https://www.cyclepay.org/?dest=ledger&to=<principal>&usd=<amount>`), for the
-agent to relay to you.
+agent to relay to you. The amount is what those cycles cost at CyclePay's
+current rate, card fee included; when the rate cannot be read, the link
+leaves it out.
 
 Calls are signed as your **default Internet Identity account at
 `https://cli.id.ai`**, the origin `icp identity link web` links an icp CLI

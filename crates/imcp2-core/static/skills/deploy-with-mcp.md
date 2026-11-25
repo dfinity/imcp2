@@ -272,12 +272,14 @@ created and their ids.
    delete the directory, and only then deploy again; otherwise the retry
    creates a second set.
 9. **NOT ENOUGH CYCLES.** The deploy account could not pay for a new
-   canister. The error says what the funds needed are estimated at, $3 for
-   each canister still to be created, and gives a CyclePay link
+   canister. The error says how many cycles the canisters still to be
+   created need, and gives a CyclePay link
    (`https://www.cyclepay.org/?dest=ledger&to=<principal>&usd=<amount>`)
-   where the user can buy cycles by card, for the deploy principal and that
-   amount. First do step 3 with the returned `canister_ids`, right away and
-   whether or not the user pays: a canister created before the failure is in
-   the mapping and is not created again. Then relay the estimate and the
-   link to the user as given, and do not retry until they say they have
+   where the user can buy them by card for the deploy principal. The amount
+   is what those cycles cost at CyclePay's current rate, card fee included;
+   when the rate cannot be read, the link has no `&usd=` and the user picks
+   the amount. First do step 3 with the returned `canister_ids`, right away
+   and whether or not the user pays: a canister created before the failure
+   is in the mapping and is not created again. Then relay the cycles needed
+   and the link to the user as given, and do not retry until they say they have
    paid; then deploy again with the same bundle and that mapping.
