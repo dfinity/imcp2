@@ -303,7 +303,7 @@ impl<C> UntilStopped<C> {
 
     /// Note in `creations` what the calls that create canisters come to: the
     /// cycles ledger refusing one because the caller's balance does not
-    /// cover it, and one going unanswered.
+    /// cover it, and one ending without a verdict.
     pub fn noting(mut self, creations: Creations) -> Self {
         self.creations = creations;
         self
@@ -342,9 +342,12 @@ const CREATE_CANISTER: &str = "create_canister";
 /// wording of an error cannot say whose balance fell short; where the call
 /// went can.
 ///
-/// **A creation went unanswered.** That call may have made its canister all
-/// the same, one nothing lists, and running the deploy again would make it
-/// a second time.
+/// **A creation ended without a verdict.** It went unanswered, or it failed
+/// in a way that says nothing of whether it was carried out: the reply that
+/// would not parse and the certificate that would not verify both come
+/// after the call was sent. Such a call may have made its canister all the
+/// same, one nothing lists, and running the deploy again would make it a
+/// second time. A rejection is a verdict and is not of this kind.
 #[derive(Clone, Default)]
 pub struct Creations(Arc<Mutex<Seen>>);
 
@@ -352,7 +355,7 @@ pub struct Creations(Arc<Mutex<Seen>>);
 #[derive(Clone, Copy, Default)]
 struct Seen {
     short_of_cycles: Option<u128>,
-    unanswered: bool,
+    uncertain: bool,
 }
 
 impl Creations {
@@ -363,9 +366,10 @@ impl Creations {
         self.seen().short_of_cycles
     }
 
-    /// Whether a call creating a canister went unanswered.
-    pub fn unanswered(&self) -> bool {
-        self.seen().unanswered
+    /// Whether a call creating a canister ended without a verdict: its
+    /// canister may exist all the same.
+    pub fn uncertain(&self) -> bool {
+        self.seen().uncertain
     }
 
     fn seen(&self) -> Seen {
@@ -380,7 +384,11 @@ impl Creations {
         }
         let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
         match result {
-            Err(CallError::Unanswered { .. }) => seen.unanswered = true,
+            // No verdict either way. `Failed` is of that kind too: it is
+            // what a call that was sent comes back as when its reply cannot
+            // be read. (This wrapper's own refusal of a call it never made
+            // is not seen here: it returns before the call.)
+            Err(CallError::Unanswered { .. } | CallError::Failed { .. }) => seen.uncertain = true,
             Ok(reply) if canister == CYCLES_LEDGER_PRINCIPAL => {
                 if let Ok(CreateCanisterResponse::Err(CreateCanisterError::InsufficientFunds {
                     balance,
@@ -508,9 +516,17 @@ mod tests {
         }
     }
 
-    /// Calls whose every update is answered with these bytes, or goes
-    /// unanswered.
-    struct Answering(Option<Vec<u8>>);
+    /// What every update of [`Answering`] comes to.
+    #[derive(Clone)]
+    enum Comes {
+        Answered(Vec<u8>),
+        Unanswered,
+        Failed,
+        Rejected,
+    }
+
+    /// Calls whose every update comes to the same thing.
+    struct Answering(Comes);
 
     #[async_trait]
     impl CanisterCalls for Answering {
@@ -518,11 +534,24 @@ mod tests {
             Principal::anonymous()
         }
         async fn update(&self, call: Call) -> Result<Vec<u8>, CallError> {
-            self.0.clone().ok_or_else(|| CallError::Unanswered {
-                canister: call.canister,
-                method: call.method,
-                source: "timed out".into(),
-            })
+            let (canister, method) = (call.canister, call.method);
+            match self.0.clone() {
+                Comes::Answered(reply) => Ok(reply),
+                Comes::Unanswered => {
+                    Err(CallError::Unanswered { canister, method, source: "timed out".into() })
+                }
+                Comes::Failed => Err(CallError::Failed {
+                    canister,
+                    method,
+                    source: "the certificate did not verify".into(),
+                }),
+                Comes::Rejected => Err(CallError::Rejected {
+                    canister,
+                    method,
+                    code: None,
+                    message: "the canister said no".into(),
+                }),
+            }
         }
         async fn query(&self, _call: Call) -> Result<Vec<u8>, CallError> {
             Ok(Vec::new())
@@ -553,28 +582,25 @@ mod tests {
     }
 
     /// What is noted after an update of `method` on `canister` comes to
-    /// `reply` (`None`: it goes unanswered), the result reaching the caller
-    /// as it came: the balance the ledger refused with, and whether a
-    /// creation went unanswered.
-    async fn noted(
-        canister: Principal,
-        method: &str,
-        reply: Option<&[u8]>,
-    ) -> (Option<u128>, bool) {
+    /// `comes`, the result reaching the caller as it came: the balance the
+    /// ledger refused with, and whether a creation ended without a verdict.
+    async fn noted(canister: Principal, method: &str, comes: Comes) -> (Option<u128>, bool) {
         let creations = Creations::default();
         let calls = UntilStopped::new(
-            Answering(reply.map(<[u8]>::to_vec)),
+            Answering(comes.clone()),
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
         )
         .noting(creations.clone());
         let result = calls.update(Call::new(canister, method, Vec::new())).await;
-        match (result, reply) {
-            (Ok(answer), Some(reply)) => assert_eq!(answer, reply, "passed on as it came"),
-            (Err(CallError::Unanswered { .. }), None) => {}
+        match (result, comes) {
+            (Ok(answer), Comes::Answered(reply)) => assert_eq!(answer, reply, "as it came"),
+            (Err(CallError::Unanswered { .. }), Comes::Unanswered) => {}
+            (Err(CallError::Failed { .. }), Comes::Failed) => {}
+            (Err(CallError::Rejected { .. }), Comes::Rejected) => {}
             (other, _) => panic!("the call's result was changed: {other:?}"),
         }
-        (creations.short_of_cycles(), creations.unanswered())
+        (creations.short_of_cycles(), creations.uncertain())
     }
 
     // The cycles ledger refusing a creation for lack of cycles is noted,
@@ -585,40 +611,52 @@ mod tests {
     // ledger's, or an answer that is not one at all.
     #[tokio::test]
     async fn only_the_ledgers_own_refusal_of_a_creation_is_noted() {
+        let answered = |reply: Vec<u8>| Comes::Answered(reply);
         let short = Encode!(&CreateCanisterResponse::Err(CreateCanisterError::InsufficientFunds {
             balance: candid::Nat::from(7u8)
         }))
         .unwrap();
         let ledger = CYCLES_LEDGER_PRINCIPAL;
-        assert_eq!(noted(ledger, CREATE_CANISTER, Some(&short)).await, (Some(7), false));
+        assert_eq!(noted(ledger, CREATE_CANISTER, answered(short.clone())).await, (Some(7), false));
 
         // An engine operator, answering alike.
-        assert_eq!(noted(canister(), CREATE_CANISTER, Some(&short)).await, (None, false));
+        assert_eq!(
+            noted(canister(), CREATE_CANISTER, answered(short.clone())).await,
+            (None, false)
+        );
         // The ledger, asked for something else.
-        assert_eq!(noted(ledger, "icrc1_balance_of", Some(&short)).await, (None, false));
+        assert_eq!(noted(ledger, "icrc1_balance_of", answered(short)).await, (None, false));
 
         let created = Encode!(&CreateCanisterResponse::Ok {
             block_id: candid::Nat::from(1u8),
             canister_id: canister(),
         })
         .unwrap();
-        assert_eq!(noted(ledger, CREATE_CANISTER, Some(&created)).await, (None, false));
+        assert_eq!(noted(ledger, CREATE_CANISTER, answered(created)).await, (None, false));
         let other = Encode!(&CreateCanisterResponse::Err(CreateCanisterError::TooOld)).unwrap();
-        assert_eq!(noted(ledger, CREATE_CANISTER, Some(&other)).await, (None, false));
-        assert_eq!(noted(ledger, CREATE_CANISTER, Some(b"not candid")).await, (None, false));
+        assert_eq!(noted(ledger, CREATE_CANISTER, answered(other)).await, (None, false));
+        let not_candid = answered(b"not candid".to_vec());
+        assert_eq!(noted(ledger, CREATE_CANISTER, not_candid).await, (None, false));
     }
 
-    // A creation that goes unanswered is noted, whoever it was asked of:
-    // the ledger, an engine's operator, the management canister. The
-    // deploy's log gives such a call one line that does not say so. A call
-    // that creates nothing and goes unanswered is not noted here: running
-    // it again makes no second canister.
+    // A creation that ends without a verdict is noted, whoever it was asked
+    // of: the ledger, an engine's operator, the management canister. One
+    // that went unanswered, and one that failed, which is what a call that
+    // was sent comes back as when its reply cannot be read: either may have
+    // made its canister. The deploy's log gives such a call one line that
+    // does not say so. A rejection is a verdict, and is not noted. Nor is a
+    // call that creates nothing: running it again makes no second canister.
     #[tokio::test]
-    async fn a_creation_that_goes_unanswered_is_noted() {
+    async fn a_creation_that_ends_without_a_verdict_is_noted() {
         for asked in [CYCLES_LEDGER_PRINCIPAL, canister(), Principal::management_canister()] {
-            assert_eq!(noted(asked, CREATE_CANISTER, None).await, (None, true), "{asked}");
+            for comes in [Comes::Unanswered, Comes::Failed] {
+                assert_eq!(noted(asked, CREATE_CANISTER, comes).await, (None, true), "{asked}");
+            }
+            assert_eq!(noted(asked, CREATE_CANISTER, Comes::Rejected).await, (None, false));
         }
-        assert_eq!(noted(canister(), "install_code", None).await, (None, false));
+        for comes in [Comes::Unanswered, Comes::Failed] {
+            assert_eq!(noted(canister(), "install_code", comes).await, (None, false));
+        }
     }
 
     // The call that was in flight when the stop came is answered, and its

@@ -173,13 +173,14 @@ pub fn advertised() -> String {
 /// engine's operator, is not the user's balance falling short, and the
 /// outcome does not record it as one. A deploy with every canister it
 /// targeted has nothing more cycles would help. And a deploy in which a
-/// call went unanswered is not one to send back for another run: a creation
-/// that did ([`DeployOutcome::unanswered_creation`], known from the calls
-/// themselves, since the log does not say it of any failure but the first)
-/// may have created a canister nothing lists, and a second run would create
-/// it again. Its error says to check first, and the steps here, which end
-/// in deploying again, are withheld. So are they when the error or the log
-/// says it of any other call.
+/// creation ended without a verdict is not one to send back for another
+/// run: such a call, unanswered or failed after it was sent
+/// ([`DeployOutcome::uncertain_creation`], known from the calls themselves,
+/// since the log does not say it of any failure but the first), may have
+/// created a canister nothing lists, and a second run would create it
+/// again. Its error says to check first, and the steps here, which end in
+/// deploying again, are withheld. So are they when the error or the log
+/// says of any other call that it went unanswered.
 pub(super) fn after(
     outcome: &DeployOutcome,
     principal: Principal,
@@ -187,9 +188,9 @@ pub(super) fn after(
 ) -> Option<Funding> {
     let balance = outcome.short_of_cycles?;
     let to_create = still_to_create(outcome);
-    let unanswered = outcome.unanswered_creation
+    let uncertain = outcome.uncertain_creation
         || outcome.error.iter().chain(&outcome.log).any(|line| went_unanswered(line));
-    if outcome.status != Status::Failed || to_create == 0 || unanswered {
+    if outcome.status != Status::Failed || to_create == 0 || uncertain {
         return None;
     }
     Some(Funding::new(principal, to_create, cycles, balance))
@@ -338,7 +339,7 @@ mod tests {
             error: Some(error.into()),
             log: Vec::new(),
             short_of_cycles,
-            unanswered_creation: false,
+            uncertain_creation: false,
         }
     }
 
@@ -443,17 +444,18 @@ mod tests {
 
     // Canisters are created at once, and the deploy's error is its first
     // failure alone. With the ledger's refusal first and another creation
-    // timing out, the error is the refusal and the log has, for the other,
-    // one line that does not say it went unanswered. The calls themselves
-    // say so, and that is enough to withhold the steps.
+    // ending without a verdict, timed out or failed after it was sent, the
+    // error is the refusal and the log has, for the other, one line that
+    // does not say so. The calls themselves do, and that is enough to
+    // withhold the steps.
     #[test]
-    fn a_second_creation_that_went_unanswered_withholds_the_steps_too() {
+    fn a_second_creation_without_a_verdict_withholds_the_steps_too() {
         let who = Principal::management_canister();
         let mut second = outcome(Status::Failed, &refusal_as_worded(), Some(7));
         second.log.push("  create frontend: failed: failed to create canister".into());
         second.log.push("  create worker: failed: a canister call failed".into());
         assert!(after(&second, who, CYCLES).is_some(), "nothing in the text says it");
-        second.unanswered_creation = true;
+        second.uncertain_creation = true;
         assert!(after(&second, who, CYCLES).is_none());
     }
 

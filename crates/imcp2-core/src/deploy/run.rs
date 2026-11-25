@@ -190,11 +190,12 @@ pub struct DeployOutcome {
     /// user's cycles ran short. From the ledger's own answer
     /// ([`Creations`]), never from the wording of an error.
     pub short_of_cycles: Option<u128>,
-    /// Whether a call creating a canister went unanswered: that canister may
-    /// exist without being in `canister_ids`, and `error` says so. From the
-    /// calls themselves ([`Creations`]): the error is the first failure
-    /// alone, and the log gives any other a line that does not say it.
-    pub unanswered_creation: bool,
+    /// Whether a call creating a canister ended without a verdict, having
+    /// gone unanswered or failed after it was sent: that canister may exist
+    /// without being in `canister_ids`, and `error` says so. From the calls
+    /// themselves ([`Creations`]): the error is the first failure alone, and
+    /// the log gives any other a line that does not say it.
+    pub uncertain_creation: bool,
 }
 
 /// An error made before the deploy could begin: the request itself was
@@ -444,7 +445,7 @@ pub async fn deploy_bundle(
         error: None,
         log: Vec::new(),
         short_of_cycles: None,
-        unanswered_creation: false,
+        uncertain_creation: false,
     };
     if canisters.is_empty() {
         return Ok(outcome);
@@ -473,7 +474,7 @@ pub async fn deploy_bundle(
     // whether any was made at all: see [`run_until_stopped`].
     // They also note what the calls that create canisters come to: the
     // cycles ledger refusing one for lack of cycles, which is how a deploy
-    // knows the user's balance ran short, and one going unanswered.
+    // knows the user's balance ran short, and one ending without a verdict.
     let begun = Arc::new(AtomicBool::new(false));
     let creations = Creations::default();
     let calls = Deferred::new({
@@ -520,7 +521,7 @@ pub async fn deploy_bundle(
     outcome.log = collector.await.unwrap_or_default();
     outcome.created = report.created;
     outcome.short_of_cycles = creations.short_of_cycles();
-    outcome.unanswered_creation = creations.unanswered();
+    outcome.uncertain_creation = creations.uncertain();
 
     let interrupted = "the deploy was interrupted before it finished (the call was cancelled, the \
                        client went away or the server is stopping); `canister_ids` holds every \
@@ -562,9 +563,10 @@ pub async fn deploy_bundle(
         }
     }
 
-    // A creation that went unanswered is said in the error whichever
-    // failure the error is of: the run's error is its first failure alone.
-    outcome.error = outcome.error.map(|e| warned_of_creation(e, outcome.unanswered_creation));
+    // A creation that ended without a verdict is said in the error
+    // whichever failure the error is of: the run's error is its first
+    // failure alone.
+    outcome.error = outcome.error.map(|e| warned_of_creation(e, outcome.uncertain_creation));
 
     // What this function itself has to say goes where the run's lines went:
     // to the watcher as it is said, and into the outcome's log.
@@ -703,13 +705,20 @@ pub(super) fn went_unanswered(text: &str) -> bool {
 const UNANSWERED: &str = ". A call went unanswered: if it was creating a canister, that canister \
                           may exist without being listed, so check before deploying again";
 
-/// `error`, a deploy's, with the warning a creation that went unanswered
-/// calls for, when one did and the error does not carry it already. The
-/// error is the run's first failure: canisters are created at once, and a
-/// second creation that timed out is not in it.
-fn warned_of_creation(error: String, unanswered_creation: bool) -> String {
-    match unanswered_creation && !error.contains(UNANSWERED) {
-        true => format!("{error}{UNANSWERED}"),
+/// What follows a deploy's error when a call creating a canister ended
+/// without a verdict, unanswered or failed after it was sent.
+const UNCERTAIN_CREATION: &str = ". A call creating a canister ended without a verdict: that \
+                                  canister may exist without being listed, so check before \
+                                  deploying again";
+
+/// `error`, a deploy's, with the warning a creation that ended without a
+/// verdict calls for, when one did and the error does not carry a warning
+/// of the kind already. The error is the run's first failure: canisters are
+/// created at once, and a second creation that timed out is not in it.
+fn warned_of_creation(error: String, uncertain_creation: bool) -> String {
+    let warned = error.contains(UNANSWERED) || error.contains(UNCERTAIN_CREATION);
+    match uncertain_creation && !warned {
+        true => format!("{error}{UNCERTAIN_CREATION}"),
         false => error,
     }
 }
@@ -1745,17 +1754,22 @@ mod tests {
         }
     }
 
-    // A creation that went unanswered beside the failure the error is of is
-    // said too, once: the error is the first failure alone, and the warning
-    // is what keeps the caller from creating that canister a second time.
+    // A creation that ended without a verdict beside the failure the error
+    // is of is said too, once: the error is the first failure alone, and the
+    // warning is what keeps the caller from creating that canister a second
+    // time. An error that already warns of an unanswered call is left as it
+    // is.
     #[test]
-    fn a_creation_unanswered_beside_the_first_failure_is_warned_of() {
+    fn a_creation_without_a_verdict_beside_the_first_failure_is_warned_of() {
         let refused = "failed to create canister: Insufficient cycles.".to_string();
         assert_eq!(warned_of_creation(refused.clone(), false), refused);
         let warned = warned_of_creation(refused.clone(), true);
-        assert!(warned.starts_with(&refused) && went_unanswered(&warned), "{warned}");
+        assert!(warned.starts_with(&refused), "{warned}");
+        assert!(warned.contains("may exist without being listed"), "{warned}");
         assert!(warned.contains("check before deploying again"), "{warned}");
         assert_eq!(warned_of_creation(warned.clone(), true), warned, "said once");
+        let unanswered = failed_with("call to 'create_canister' on aaaaa-aa went unanswered");
+        assert_eq!(warned_of_creation(unanswered.clone(), true), unanswered, "said already");
     }
 
     // A deploy that failed with a call unanswered was not stopped, and its

@@ -1720,7 +1720,7 @@ mod tests {
             error: Some("install failed".into()),
             log: vec!["Creating canisters: ok".into()],
             short_of_cycles: None,
-            unanswered_creation: false,
+            uncertain_creation: false,
         };
         let output = DeployBundleOutput::from_outcome(&outcome);
         assert_eq!(output.status, "failed");

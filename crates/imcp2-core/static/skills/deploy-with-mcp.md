@@ -216,9 +216,10 @@ had created are in the answer; the rest were not created. Go by that field,
 not by the error's wording: a failure that mentions cycles and has no
 `funding` (a canister that ran out while its code was installed, say) is not
 one that adding cycles to this account fixes. Nor is there any `funding`
-when the error says a call went unanswered, even if cycles were short as
-well: pitfall 9 comes first then, and deploying again does not. Disregard
-the icp CLI commands the error itself suggests. `funding` holds:
+when the error says a canister may exist without being listed, even if
+cycles were short as well: pitfall 9 comes first then, and deploying again
+does not. Disregard the icp CLI commands the error itself suggests.
+`funding` holds:
 
 - `principal`: the principal `icp_deploy` creates canisters as. Its Cycles
   Ledger account holds the balance, and is the account added cycles must be
@@ -321,8 +322,9 @@ created and their ids.
    interrupts the deploy the same way and still answers: the result's
    `canister_ids` holds what is known to have been created, so do step 3
    with it and deploy again. One exception, which the result's error names:
-   if it says a call **went unanswered** or **was given up on**, a canister
-   that call was creating may exist without being listed. Do not deploy
+   if it says a call **went unanswered**, **was given up on** or **ended
+   without a verdict**, a canister that call was creating may exist without
+   being listed. Do not deploy
    again yet, and do not go looking for it yourself: nothing here can list
    the canisters an identity controls (`icp canister list` shows the
    project's canister names, not what exists), and a cycles balance that

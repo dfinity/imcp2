@@ -180,15 +180,18 @@ Three deploys get none though cycles are mentioned or even refused:
 
 - one refused by anything but the ledger, as above;
 - one with nothing left to create, which no added cycles would help;
-- one in which a creation went unanswered. That call may have created a
-  canister nothing lists, and a creation carries nothing the ledger could
-  recognise a repeat by, so a second run would create it again. This too is
-  noted where the calls pass (`DeployOutcome::unanswered_creation`), since
-  the deploy's own report does not reliably say it: the error is the first
-  failure alone, and of a creation that timed out beside it the log has one
-  line, "a canister call failed". The error now carries the warning to check
-  before deploying again whichever failure came first, and steps that end
-  in deploying again are not put beside it.
+- one in which a creation ended without a verdict: it went unanswered, or
+  it failed after it was sent, which is what a reply that will not parse or
+  a certificate that will not verify comes back as. That call may have
+  created a canister nothing lists, and a creation carries nothing the
+  ledger could recognise a repeat by, so a second run would create it
+  again. This too is noted where the calls pass
+  (`DeployOutcome::uncertain_creation`), since the deploy's own report does
+  not reliably say it: the error is the first failure alone, and of a
+  creation that ended so beside it the log has one line, "a canister call
+  failed". A rejection is a verdict and is not counted. The error now
+  carries the warning to check before deploying again whichever failure
+  came first, and steps that end in deploying again are not put beside it.
 
 The cost: a user with no cycles learns it from a failed deploy. Nothing is
 created by a deploy that cannot afford its first canister, and one that can
@@ -335,8 +338,8 @@ differs between providers, the agent reads from the provider.
 | | |
 |---|---|
 | `crates/imcp2-core/src/deploy/funding.rs` | The list, the sentence of the description, when a deploy is answered with `funding`, the answer and its steps; tests. |
-| `crates/imcp2-core/src/deploy/calls.rs` | `Creations`: the ledger's typed refusal of a creation, and a creation that went unanswered, noted where the deploy's calls pass. |
-| `crates/imcp2-core/src/deploy/run.rs` | `DeployOutcome::short_of_cycles` and `unanswered_creation`; the warning in the error. |
+| `crates/imcp2-core/src/deploy/calls.rs` | `Creations`: the ledger's typed refusal of a creation, and a creation that ended without a verdict, noted where the deploy's calls pass. |
+| `crates/imcp2-core/src/deploy/run.rs` | `DeployOutcome::short_of_cycles` and `uncertain_creation`; the warning in the error. |
 | `crates/imcp2-core/src/deploy/mod.rs` | `icp_deploy`: the description, `funding` in the output. |
 | `crates/imcp2-core/src/deploy/server.rs` | One sentence in the server's instructions. |
 | `crates/imcp2-core/static/skills/deploy-with-mcp.md` | "When the cycles run short". |
