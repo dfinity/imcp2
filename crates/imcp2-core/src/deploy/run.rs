@@ -719,9 +719,10 @@ pub const USD_PER_CANISTER: u64 = 4;
 /// least CyclePay takes by card from a user who has not signed in there.
 pub const CYCLEPAY_MIN_USD: u64 = 5;
 
-/// The most CyclePay takes in one payment, in whole US dollars; a link that
-/// names more has its amount set aside.
-const CYCLEPAY_MAX_USD: u64 = 200;
+/// The most CyclePay takes by card in one payment from a user who has not
+/// signed in there, in whole US dollars; a link that names more asks for a
+/// sign-in first.
+const CYCLEPAY_MAX_USD: u64 = 100;
 
 /// The CyclePay page that funds `deploy_principal` with `usd` dollars
 /// preselected. `from=icp-cli` is the tag CyclePay reads for a tool's link:
@@ -1979,18 +1980,18 @@ mod tests {
             assert!(!said.contains("One payment is"), "{said}");
         }
         // The most one payment takes is asked for whole, in one link.
-        let said_50 = said(50);
-        assert!(said_50.contains("$200 for the 50 canisters still to be created"), "{said_50}");
-        assert!(said_50.contains("to=2vxsx-fae&usd=200&from=icp-cli "), "{said_50}");
-        assert!(!said_50.contains("One payment is"), "{said_50}");
+        let said_25 = said(25);
+        assert!(said_25.contains("$100 for the 25 canisters still to be created"), "{said_25}");
+        assert!(said_25.contains("to=2vxsx-fae&usd=100&from=icp-cli "), "{said_25}");
+        assert!(!said_25.contains("One payment is"), "{said_25}");
         // Past it the estimate is whole, the link is for one payment's most,
         // and the user is told the rest takes more.
         let said_70 = said(70);
         assert!(said_70.contains("$280 for the 70 canisters still to be created"), "{said_70}");
-        assert!(said_70.contains("to=2vxsx-fae&usd=200&from=icp-cli "), "{said_70}");
+        assert!(said_70.contains("to=2vxsx-fae&usd=100&from=icp-cli "), "{said_70}");
         assert!(
             said_70.contains(
-                "deploying. One payment is $200 at the most, which is what the link is for; the \
+                "deploying. One payment is $100 at the most, which is what the link is for; the \
                  rest takes further payments there.\" Do not retry"
             ),
             "{said_70}"
