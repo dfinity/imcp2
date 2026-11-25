@@ -727,7 +727,7 @@ fn insufficient_cycles(deploy_principal: Principal, cycles: u128, ended: &str) -
          Then retry deploying with the same bundle and with the `canister_ids` returned here \
          (write them back to the project first): any canister already created is listed there \
          and will not be created again. \
-         `icp_cycles_balance` reports. Details: {details}"
+         Details: {details}"
     )
 }
 
