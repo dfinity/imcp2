@@ -715,16 +715,15 @@ fn is_insufficient_cycles(error: &DeployError) -> bool {
 /// next. The library's own text is left out: its advice is the CLI's.
 fn insufficient_cycles(deploy_principal: Principal, cycles: u128) -> String {
     format!(
-        "NOT ENOUGH CYCLES: the deploy could not create canister(s) because your Internet Identity \
-         does not have enough cycles. Each new \
-         canister is funded with {cycles} cycles from that identity's cycles balance. Tell the \
-         user, in these words or close to them: \"Your identity \
-         needs more cycles before this app can be deployed. You can fund future with \
-         CyclePay at {CYCLEPAY_URL}{deploy_principal} — let me know once the payment has gone \
-         through and I'll retry deploying.\" Do not retry until the user confirms they are done funding. \
-         Then retry deploying with the same bundle and with the `canister_ids` returned here \
-         (write them back to the project first): any canister already created is listed there \
-         and will not be created again."
+        "NOT ENOUGH CYCLES: the deploy could not create canister(s) because your Internet \
+         Identity does not have enough cycles. Each new canister is funded with {cycles} cycles \
+         from that identity's cycles balance. First, write the `canister_ids` returned here back \
+         to the project now, whatever happens next: any canister already created is listed \
+         there and will not be created again. Then tell the user, in these words or close to \
+         them: \"Your identity needs more cycles before this app can be deployed. You can fund \
+         it with CyclePay at {CYCLEPAY_URL}{deploy_principal} — let me know once the payment \
+         has gone through and I'll retry deploying.\" Do not retry until the user confirms they \
+         are done funding; then retry deploying with the same bundle and those `canister_ids`."
     )
 }
 
@@ -1890,6 +1889,10 @@ mod tests {
         let said = insufficient_cycles(deploy_principal, 2_000_000_000_000);
         assert!(said.starts_with("NOT ENOUGH CYCLES: "), "{said}");
         assert!(said.contains("https://www.cyclepay.org/?dest=ledger&to=2vxsx-fae "), "{said}");
+        assert!(said.contains("You can fund it with CyclePay at"), "{said}");
+        // The ids are saved before the user is told, not after they have paid.
+        let (save, tell) = (said.find("write the `canister_ids`"), said.find("Then tell the user"));
+        assert!(save.zip(tell).is_some_and(|(save, tell)| save < tell), "{said}");
         // The library's text, whose advice is the CLI's, is not passed on.
         assert!(!said.contains("Details") && !said.contains("icp cycles mint"), "{said}");
         assert!(!said.contains('\n') && !said.contains("  "), "{said}");
