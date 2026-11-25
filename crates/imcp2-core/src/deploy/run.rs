@@ -752,10 +752,10 @@ fn is_insufficient_cycles(error: &DeployError) -> bool {
 /// the funds needed are estimated at — [`USD_PER_CANISTER`] for each of the
 /// `to_create` canisters the deploy has still to create, and no less than
 /// [`CYCLEPAY_MIN_USD`] — where to buy cycles for that amount, for the
-/// principal to fund (the deploy identity's, which is not the one
-/// `icp_cycles_balance` reports), and what to do next. An estimate over what
-/// one payment takes says so: the link is then for one payment's most. The
-/// library's own text is left out: its advice is the CLI's.
+/// principal to fund (the deploy identity's), and what to do next. An
+/// estimate over what one payment takes says so: the link is then for one
+/// payment's most. The library's own text is left out: its advice is the
+/// CLI's.
 fn insufficient_cycles(deploy_principal: Principal, cycles: u128, to_create: usize) -> String {
     // A run that failed creating a canister has at least that one to create.
     let to_create = u64::try_from(to_create).unwrap_or(u64::MAX).max(1);

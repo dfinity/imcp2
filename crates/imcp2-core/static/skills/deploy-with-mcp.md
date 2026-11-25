@@ -46,8 +46,7 @@ not know the canisters already exist and would create a second set.
   cycles unless `cycles` says otherwise. Before a deploy that will create canisters, tell the
   user how many and confirm; creation is not undone by a later failure. The
   balance spent is the deploy account's (the user's Internet Identity account
-  at `https://cli.id.ai`), which is not the principal `icp_cycles_balance`
-  reports.
+  at `https://cli.id.ai`).
 - An environment on the `ic` network (mainnet), which every manifest has.
   The tool deploys to the Internet Computer only: an environment on any other
   network — the default `local`, a testnet — is refused. Deploy those with
