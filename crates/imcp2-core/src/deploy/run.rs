@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span};
 
 use crate::deploy::{
-    calls::{AgentCalls, LedgerRefusal, UntilStopped},
+    calls::{AgentCalls, Creations, UntilStopped},
     host::{self, AllowedPlugins, BundleLimits, PluginLimits},
 };
 
@@ -188,8 +188,13 @@ pub struct DeployOutcome {
     /// The balance the cycles ledger reported as it refused to create a
     /// canister because the balance did not cover it, when it did: the
     /// user's cycles ran short. From the ledger's own answer
-    /// ([`LedgerRefusal`]), never from the wording of an error.
+    /// ([`Creations`]), never from the wording of an error.
     pub short_of_cycles: Option<u128>,
+    /// Whether a call creating a canister went unanswered: that canister may
+    /// exist without being in `canister_ids`, and `error` says so. From the
+    /// calls themselves ([`Creations`]): the error is the first failure
+    /// alone, and the log gives any other a line that does not say it.
+    pub unanswered_creation: bool,
 }
 
 /// An error made before the deploy could begin: the request itself was
@@ -439,6 +444,7 @@ pub async fn deploy_bundle(
         error: None,
         log: Vec::new(),
         short_of_cycles: None,
+        unanswered_creation: false,
     };
     if canisters.is_empty() {
         return Ok(outcome);
@@ -465,19 +471,20 @@ pub async fn deploy_bundle(
     //
     // The calls stop being made when the deploy is told to stop, and say
     // whether any was made at all: see [`run_until_stopped`].
-    // They also note the cycles ledger refusing a creation for lack of
-    // cycles, which is how a deploy knows the user's balance ran short.
+    // They also note what the calls that create canisters come to: the
+    // cycles ledger refusing one for lack of cycles, which is how a deploy
+    // knows the user's balance ran short, and one going unanswered.
     let begun = Arc::new(AtomicBool::new(false));
-    let refusal = LedgerRefusal::default();
+    let creations = Creations::default();
     let calls = Deferred::new({
-        let (stop, begun, refusal) = (watch.stop.clone(), begun.clone(), refusal.clone());
+        let (stop, begun, creations) = (watch.stop.clone(), begun.clone(), creations.clone());
         move || {
             let (identity, stop) = (identity.clone(), stop.clone());
-            let (begun, refusal) = (begun.clone(), refusal.clone());
+            let (begun, creations) = (begun.clone(), creations.clone());
             async move {
                 let agent = mainnet_agent(identity).map_err(RequestError)?;
                 let calls = AgentCalls::new(agent).map_err(RequestError)?;
-                let calls = UntilStopped::new(calls, stop, begun).noting(refusal);
+                let calls = UntilStopped::new(calls, stop, begun).noting(creations);
                 let calls: Arc<dyn CanisterCalls> = Arc::new(calls);
                 Ok::<_, RequestError>(calls)
             }
@@ -512,7 +519,8 @@ pub async fn deploy_bundle(
     drop(reporter);
     outcome.log = collector.await.unwrap_or_default();
     outcome.created = report.created;
-    outcome.short_of_cycles = refusal.balance();
+    outcome.short_of_cycles = creations.short_of_cycles();
+    outcome.unanswered_creation = creations.unanswered();
 
     let interrupted = "the deploy was interrupted before it finished (the call was cancelled, the \
                        client went away or the server is stopping); `canister_ids` holds every \
@@ -553,6 +561,10 @@ pub async fn deploy_bundle(
             });
         }
     }
+
+    // A creation that went unanswered is said in the error whichever
+    // failure the error is of: the run's error is its first failure alone.
+    outcome.error = outcome.error.map(|e| warned_of_creation(e, outcome.unanswered_creation));
 
     // What this function itself has to say goes where the run's lines went:
     // to the watcher as it is said, and into the outcome's log.
@@ -690,6 +702,17 @@ pub(super) fn went_unanswered(text: &str) -> bool {
 /// have taken effect all the same.
 const UNANSWERED: &str = ". A call went unanswered: if it was creating a canister, that canister \
                           may exist without being listed, so check before deploying again";
+
+/// `error`, a deploy's, with the warning a creation that went unanswered
+/// calls for, when one did and the error does not carry it already. The
+/// error is the run's first failure: canisters are created at once, and a
+/// second creation that timed out is not in it.
+fn warned_of_creation(error: String, unanswered_creation: bool) -> String {
+    match unanswered_creation && !error.contains(UNANSWERED) {
+        true => format!("{error}{UNANSWERED}"),
+        false => error,
+    }
+}
 
 /// What a deploy that failed says of itself when its run ended in `ended`
 /// (an error chain): the chain, and the warning it calls for when a call
@@ -1720,6 +1743,19 @@ mod tests {
             assert!(said.contains("went unanswered"), "{said}");
             assert!(said.contains("may exist without being listed"), "{said}");
         }
+    }
+
+    // A creation that went unanswered beside the failure the error is of is
+    // said too, once: the error is the first failure alone, and the warning
+    // is what keeps the caller from creating that canister a second time.
+    #[test]
+    fn a_creation_unanswered_beside_the_first_failure_is_warned_of() {
+        let refused = "failed to create canister: Insufficient cycles.".to_string();
+        assert_eq!(warned_of_creation(refused.clone(), false), refused);
+        let warned = warned_of_creation(refused.clone(), true);
+        assert!(warned.starts_with(&refused) && went_unanswered(&warned), "{warned}");
+        assert!(warned.contains("check before deploying again"), "{warned}");
+        assert_eq!(warned_of_creation(warned.clone(), true), warned, "said once");
     }
 
     // A deploy that failed with a call unanswered was not stopped, and its

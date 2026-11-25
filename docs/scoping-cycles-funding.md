@@ -136,14 +136,21 @@ did create, and with `funding`:
 |---|---|
 | `principal` | The deploy principal. Its Cycles Ledger account holds the balance and is the account added cycles must be delivered to. |
 | `needed` | `to create × (cycles + what the ledger takes per creation)`, for the canisters the deploy targeted and has no id for. The server counts them: it has read the bundle and the mapping, and thirteen-digit arithmetic is not what a model is good at. |
-| `balance`, `shortfall` | The balance the ledger reported as it refused the creation, and what of `needed` it does not cover. Nothing is read after the deploy. |
+| `balance`, `shortfall` | The balance the ledger reported as it refused the creation, and what of `needed` it does not cover. Nothing is read after the deploy, so both are of that moment (see below). |
 | `providers` | The list. |
 | `steps` | What to do next, the same for every provider. |
 
 Amounts in trillions are exact. The text gives each amount in T beside the
 exact count, with every digit: an amount that has to be added is never
-shown as less than it is. How many cycles to add is the user's to decide, at
-least the shortfall, and a provider may have a minimum.
+shown as less than it is.
+
+The shortfall is a guide, not an exact minimum. Canisters are created at
+once, each by its own call, so a creation still under way when the ledger
+refused another may have changed the balance since: one that then succeeded
+lowered it, one that failed after the ledger had taken its cycles had them
+returned. The fields and the steps say so, how many cycles to add is the
+user's to decide, and a provider may have a minimum. A deploy that is still
+short says so again, with the numbers of that moment.
 
 **Why only then.** `funding` is attached when the ledger itself refused a
 creation for lack of cycles and a canister is still to create, never on a
@@ -155,10 +162,10 @@ preflight on the balance would refuse deploys that were going to succeed.
 The ledger's own refusal is never wrong about that.
 
 **How the refusal is known.** From the ledger's own typed answer, where
-the deploy's calls pass (`LedgerRefusal`, on the wrapper every call of a
-deploy already goes through): an update of `create_canister` on the Cycles
-Ledger whose reply decodes to its refusal for lack of cycles is noted, with
-the balance the ledger reports in it. The outcome carries that
+the deploy's calls pass (`Creations`, on the wrapper every call of a deploy
+already goes through): an update of `create_canister` on the Cycles Ledger
+whose reply decodes to its refusal for lack of cycles is noted, with the
+balance the ledger reports in it. The outcome carries that
 (`DeployOutcome::short_of_cycles`), and `funding` is built from it.
 
 It is not read off the deploy's error. The icp library turns the typed
@@ -173,11 +180,15 @@ Three deploys get none though cycles are mentioned or even refused:
 
 - one refused by anything but the ledger, as above;
 - one with nothing left to create, which no added cycles would help;
-- one in which a call went unanswered. That call may have created a
+- one in which a creation went unanswered. That call may have created a
   canister nothing lists, and a creation carries nothing the ledger could
-  recognise a repeat by, so a second run would create it again. The deploy's error already
-  says to check before deploying again; steps that end in deploying again
-  are not put beside it.
+  recognise a repeat by, so a second run would create it again. This too is
+  noted where the calls pass (`DeployOutcome::unanswered_creation`), since
+  the deploy's own report does not reliably say it: the error is the first
+  failure alone, and of a creation that timed out beside it the log has one
+  line, "a canister call failed". The error now carries the warning to check
+  before deploying again whichever failure came first, and steps that end
+  in deploying again are not put beside it.
 
 The cost: a user with no cycles learns it from a failed deploy. Nothing is
 created by a deploy that cannot afford its first canister, and one that can
@@ -324,8 +335,8 @@ differs between providers, the agent reads from the provider.
 | | |
 |---|---|
 | `crates/imcp2-core/src/deploy/funding.rs` | The list, the sentence of the description, when a deploy is answered with `funding`, the answer and its steps; tests. |
-| `crates/imcp2-core/src/deploy/calls.rs` | `LedgerRefusal`: the ledger's typed refusal of a creation, noted where the deploy's calls pass. |
-| `crates/imcp2-core/src/deploy/run.rs` | `DeployOutcome::short_of_cycles`. |
+| `crates/imcp2-core/src/deploy/calls.rs` | `Creations`: the ledger's typed refusal of a creation, and a creation that went unanswered, noted where the deploy's calls pass. |
+| `crates/imcp2-core/src/deploy/run.rs` | `DeployOutcome::short_of_cycles` and `unanswered_creation`; the warning in the error. |
 | `crates/imcp2-core/src/deploy/mod.rs` | `icp_deploy`: the description, `funding` in the output. |
 | `crates/imcp2-core/src/deploy/server.rs` | One sentence in the server's instructions. |
 | `crates/imcp2-core/static/skills/deploy-with-mcp.md` | "When the cycles run short". |

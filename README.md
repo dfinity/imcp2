@@ -774,7 +774,7 @@ the deploy tool itself says how canisters are funded, twice.
   |---|---|
   | `principal` | The principal `icp_deploy` creates canisters as (the user's default account at `https://cli.id.ai`). Its Cycles Ledger account holds the balance and is the account added cycles must be delivered to. |
   | `needed` | What creating the canisters still missing takes: each one's cycles plus what the ledger takes for creating it. |
-  | `balance`, `shortfall` | The balance the ledger reported as it refused the creation, and what of `needed` it does not cover: the least that has to be added. |
+  | `balance`, `shortfall` | The balance the ledger reported as it refused the creation, and what of `needed` it does not cover. Canisters are created at once, so the balance is of that moment and the shortfall a guide, not an exact minimum. |
   | `providers` | The funding providers: `name`, `app_url`, `checkout`. |
   | `steps` | What an agent does next, the same for every provider. |
 
@@ -787,12 +787,15 @@ ledger returns, and not from the wording of the deploy's error: a cloud
 engine's operator creates canisters through the same method and the icp
 library words its refusal identically, so the wording cannot say whose
 balance fell short. A failure that merely mentions cycles carries no
-`funding`. Neither does a deploy in which a call went unanswered: that call
-may have created a canister nothing lists, so its error says to check before
-deploying again, and steps that end in deploying again are not put beside
-it. The cost of all this is that a user with no cycles learns it from a
-failed deploy, and on the hosted server uploads the bundle a second time
-after adding them.
+`funding`. Neither does a deploy in which a creation went unanswered: that
+call may have created a canister nothing lists, so its error says to check
+before deploying again, and steps that end in deploying again are not put
+beside it. That too is known from the calls themselves, and is now said in
+the error whichever failure came first: canisters are created at once, the
+error is the first failure alone, and the log gives any other one line that
+does not say it. The cost of all this is that a user with no cycles learns
+it from a failed deploy, and on the hosted server uploads the bundle a
+second time after adding them.
 
 The server knows no provider. It keeps a list of apps
 (`imcp2_core::deploy::FUNDING_PROVIDERS`), each a name, a URL and a phrase

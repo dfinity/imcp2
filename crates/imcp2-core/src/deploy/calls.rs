@@ -292,19 +292,20 @@ pub struct UntilStopped<C> {
     /// Set once any call has been let through: until then there is nothing
     /// in flight or unreported, and the deploy can be dropped where it is.
     begun: Arc<AtomicBool>,
-    /// Told when the cycles ledger refuses a creation for lack of cycles.
-    refusal: LedgerRefusal,
+    /// Told what the calls that create canisters come to.
+    creations: Creations,
 }
 
 impl<C> UntilStopped<C> {
     pub fn new(inner: C, stop: CancellationToken, begun: Arc<AtomicBool>) -> Self {
-        Self { inner, stop, begun, refusal: LedgerRefusal::default() }
+        Self { inner, stop, begun, creations: Creations::default() }
     }
 
-    /// Note in `refusal` when the cycles ledger refuses to create a canister
-    /// because the caller's balance does not cover it.
-    pub fn noting(mut self, refusal: LedgerRefusal) -> Self {
-        self.refusal = refusal;
+    /// Note in `creations` what the calls that create canisters come to: the
+    /// cycles ledger refusing one because the caller's balance does not
+    /// cover it, and one going unanswered.
+    pub fn noting(mut self, creations: Creations) -> Self {
+        self.creations = creations;
         self
     }
 
@@ -324,39 +325,73 @@ impl<C> UntilStopped<C> {
 /// else answers in its shape.
 const CREATE_CANISTER: &str = "create_canister";
 
-/// What a deploy's calls learned of the user's cycles balance: that the
-/// cycles ledger refused to create a canister because the balance did not
-/// cover it, and the balance it reported as it did. Shared by the calls,
-/// which note it, and the deploy, which reads it once they have ended.
+/// What a deploy's calls learned as it created canisters, which its error
+/// and its log do not reliably say. Shared by the calls, which note it, and
+/// the deploy, which reads it once they have ended.
 ///
-/// It is taken from the ledger's own typed answer to a call that went to
-/// the ledger, and from nothing else. A cloud engine's operator creates
-/// canisters through the same method and answers in the same shape, and the
-/// icp library words both refusals alike, so the wording of a deploy's error
-/// cannot say whose balance fell short; where the call went can.
+/// Canisters are created at once, each by its own call, and the deploy's
+/// error is the first failure alone: of any other the log has one line, cut
+/// to "a canister call failed". So two things are taken here from the calls
+/// themselves.
+///
+/// **The cycles ledger refused a creation for lack of cycles**, and the
+/// balance it reported as it did. From the ledger's own typed answer to a
+/// call that went to the ledger, and from nothing else: a cloud engine's
+/// operator creates canisters through the same method and answers in the
+/// same shape, and the icp library words both refusals alike, so the
+/// wording of an error cannot say whose balance fell short; where the call
+/// went can.
+///
+/// **A creation went unanswered.** That call may have made its canister all
+/// the same, one nothing lists, and running the deploy again would make it
+/// a second time.
 #[derive(Clone, Default)]
-pub struct LedgerRefusal(Arc<Mutex<Option<u128>>>);
+pub struct Creations(Arc<Mutex<Seen>>);
 
-impl LedgerRefusal {
+/// What [`Creations`] holds.
+#[derive(Clone, Copy, Default)]
+struct Seen {
+    short_of_cycles: Option<u128>,
+    unanswered: bool,
+}
+
+impl Creations {
     /// The balance the cycles ledger reported when it refused a creation
-    /// for lack of cycles, if it did.
-    pub fn balance(&self) -> Option<u128> {
+    /// for lack of cycles, if it did. With several refused, the last to be
+    /// answered; creations still in flight then may have changed it since.
+    pub fn short_of_cycles(&self) -> Option<u128> {
+        self.seen().short_of_cycles
+    }
+
+    /// Whether a call creating a canister went unanswered.
+    pub fn unanswered(&self) -> bool {
+        self.seen().unanswered
+    }
+
+    fn seen(&self) -> Seen {
         *self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Note `reply`, the answer to an update of `method` on `canister`, if
-    /// it is the cycles ledger refusing a creation for lack of cycles.
-    fn note(&self, canister: Principal, method: &str, reply: &[u8]) {
-        if canister != CYCLES_LEDGER_PRINCIPAL || method != CREATE_CANISTER {
+    /// Note what an update of `method` on `canister` came to, if it is one
+    /// that creates a canister.
+    fn note(&self, canister: Principal, method: &str, result: &Result<Vec<u8>, CallError>) {
+        if method != CREATE_CANISTER {
             return;
         }
-        if let Ok(CreateCanisterResponse::Err(CreateCanisterError::InsufficientFunds { balance })) =
-            Decode!(reply, CreateCanisterResponse)
-        {
-            // A balance past what fits is not one that fell short of
-            // anything; it is kept as the most that fits.
-            let balance = u128::try_from(balance.0).unwrap_or(u128::MAX);
-            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(balance);
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match result {
+            Err(CallError::Unanswered { .. }) => seen.unanswered = true,
+            Ok(reply) if canister == CYCLES_LEDGER_PRINCIPAL => {
+                if let Ok(CreateCanisterResponse::Err(CreateCanisterError::InsufficientFunds {
+                    balance,
+                })) = Decode!(reply, CreateCanisterResponse)
+                {
+                    // A balance past what fits is not one that fell short
+                    // of anything; it is kept as the most that fits.
+                    seen.short_of_cycles = Some(u128::try_from(balance.0).unwrap_or(u128::MAX));
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -386,9 +421,9 @@ impl<C: CanisterCalls> CanisterCalls for UntilStopped<C> {
     async fn update(&self, call: Call) -> Result<Vec<u8>, CallError> {
         self.admit(call.canister, &call.method)?;
         let (canister, method) = (call.canister, call.method.clone());
-        let reply = self.inner.update(call).await?;
-        self.refusal.note(canister, &method, &reply);
-        Ok(reply)
+        let result = self.inner.update(call).await;
+        self.creations.note(canister, &method, &result);
+        result
     }
 
     async fn query(&self, call: Call) -> Result<Vec<u8>, CallError> {
@@ -473,16 +508,21 @@ mod tests {
         }
     }
 
-    /// Calls whose every update is answered with these bytes.
-    struct Answering(Vec<u8>);
+    /// Calls whose every update is answered with these bytes, or goes
+    /// unanswered.
+    struct Answering(Option<Vec<u8>>);
 
     #[async_trait]
     impl CanisterCalls for Answering {
         fn caller(&self) -> Principal {
             Principal::anonymous()
         }
-        async fn update(&self, _call: Call) -> Result<Vec<u8>, CallError> {
-            Ok(self.0.clone())
+        async fn update(&self, call: Call) -> Result<Vec<u8>, CallError> {
+            self.0.clone().ok_or_else(|| CallError::Unanswered {
+                canister: call.canister,
+                method: call.method,
+                source: "timed out".into(),
+            })
         }
         async fn query(&self, _call: Call) -> Result<Vec<u8>, CallError> {
             Ok(Vec::new())
@@ -512,19 +552,29 @@ mod tests {
         }
     }
 
-    /// What the refusal holds after an update of `method` on `canister` is
-    /// answered with `reply`, and that the reply still reaches the caller.
-    async fn noted(canister: Principal, method: &str, reply: &[u8]) -> Option<u128> {
-        let refusal = LedgerRefusal::default();
+    /// What is noted after an update of `method` on `canister` comes to
+    /// `reply` (`None`: it goes unanswered), the result reaching the caller
+    /// as it came: the balance the ledger refused with, and whether a
+    /// creation went unanswered.
+    async fn noted(
+        canister: Principal,
+        method: &str,
+        reply: Option<&[u8]>,
+    ) -> (Option<u128>, bool) {
+        let creations = Creations::default();
         let calls = UntilStopped::new(
-            Answering(reply.to_vec()),
+            Answering(reply.map(<[u8]>::to_vec)),
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
         )
-        .noting(refusal.clone());
-        let answer = calls.update(Call::new(canister, method, Vec::new())).await.unwrap();
-        assert_eq!(answer, reply, "the answer is passed on as it came");
-        refusal.balance()
+        .noting(creations.clone());
+        let result = calls.update(Call::new(canister, method, Vec::new())).await;
+        match (result, reply) {
+            (Ok(answer), Some(reply)) => assert_eq!(answer, reply, "passed on as it came"),
+            (Err(CallError::Unanswered { .. }), None) => {}
+            (other, _) => panic!("the call's result was changed: {other:?}"),
+        }
+        (creations.short_of_cycles(), creations.unanswered())
     }
 
     // The cycles ledger refusing a creation for lack of cycles is noted,
@@ -539,22 +589,36 @@ mod tests {
             balance: candid::Nat::from(7u8)
         }))
         .unwrap();
-        assert_eq!(noted(CYCLES_LEDGER_PRINCIPAL, CREATE_CANISTER, &short).await, Some(7));
+        let ledger = CYCLES_LEDGER_PRINCIPAL;
+        assert_eq!(noted(ledger, CREATE_CANISTER, Some(&short)).await, (Some(7), false));
 
         // An engine operator, answering alike.
-        assert_eq!(noted(canister(), CREATE_CANISTER, &short).await, None);
+        assert_eq!(noted(canister(), CREATE_CANISTER, Some(&short)).await, (None, false));
         // The ledger, asked for something else.
-        assert_eq!(noted(CYCLES_LEDGER_PRINCIPAL, "icrc1_balance_of", &short).await, None);
+        assert_eq!(noted(ledger, "icrc1_balance_of", Some(&short)).await, (None, false));
 
         let created = Encode!(&CreateCanisterResponse::Ok {
             block_id: candid::Nat::from(1u8),
             canister_id: canister(),
         })
         .unwrap();
-        assert_eq!(noted(CYCLES_LEDGER_PRINCIPAL, CREATE_CANISTER, &created).await, None);
+        assert_eq!(noted(ledger, CREATE_CANISTER, Some(&created)).await, (None, false));
         let other = Encode!(&CreateCanisterResponse::Err(CreateCanisterError::TooOld)).unwrap();
-        assert_eq!(noted(CYCLES_LEDGER_PRINCIPAL, CREATE_CANISTER, &other).await, None);
-        assert_eq!(noted(CYCLES_LEDGER_PRINCIPAL, CREATE_CANISTER, b"not candid").await, None);
+        assert_eq!(noted(ledger, CREATE_CANISTER, Some(&other)).await, (None, false));
+        assert_eq!(noted(ledger, CREATE_CANISTER, Some(b"not candid")).await, (None, false));
+    }
+
+    // A creation that goes unanswered is noted, whoever it was asked of:
+    // the ledger, an engine's operator, the management canister. The
+    // deploy's log gives such a call one line that does not say so. A call
+    // that creates nothing and goes unanswered is not noted here: running
+    // it again makes no second canister.
+    #[tokio::test]
+    async fn a_creation_that_goes_unanswered_is_noted() {
+        for asked in [CYCLES_LEDGER_PRINCIPAL, canister(), Principal::management_canister()] {
+            assert_eq!(noted(asked, CREATE_CANISTER, None).await, (None, true), "{asked}");
+        }
+        assert_eq!(noted(canister(), "install_code", None).await, (None, false));
     }
 
     // The call that was in flight when the stop came is answered, and its

@@ -22,7 +22,7 @@
 //!     refuse deploys that were going to succeed. Nor is it read off the
 //!     wording of the deploy's error, which is the same when a cloud
 //!     engine's operator refuses: the deploy's calls note the ledger's own
-//!     typed answer ([`super::calls::LedgerRefusal`]).
+//!     typed answer ([`super::calls::Creations`]).
 //!
 //! And without knowing any one provider:
 //!
@@ -127,8 +127,10 @@ const WRITE_BACK: &str = "Write `canister_ids` back to the project first: it hol
 /// provider.
 pub const STEPS: &[&str] = &[
     "Tell the user what is missing, show them the funding providers, and let them pick one \
-     and how many cycles to add: at least the shortfall, and a provider may have a minimum. \
-     Which provider and how much are theirs to decide.",
+     and how many cycles to add. The shortfall is the guide, not an exact minimum: it goes by \
+     the balance the ledger reported as it refused, which the rest of the deploy may have \
+     changed since, and a provider may have a minimum. Which provider and how much are theirs \
+     to decide.",
     "Call open_app with that provider's `app_url`, then get_canister_api_doc on the canister it \
      marks [declared]. That guide is the provider's own: it says what an amount covers and \
      how to make a funding request.",
@@ -171,10 +173,13 @@ pub fn advertised() -> String {
 /// engine's operator, is not the user's balance falling short, and the
 /// outcome does not record it as one. A deploy with every canister it
 /// targeted has nothing more cycles would help. And a deploy in which a
-/// call went unanswered is not one to send back for another run: that call
+/// call went unanswered is not one to send back for another run: a creation
+/// that did ([`DeployOutcome::unanswered_creation`], known from the calls
+/// themselves, since the log does not say it of any failure but the first)
 /// may have created a canister nothing lists, and a second run would create
-/// it again, so its error says to check first and the steps here, which end
-/// in deploying again, are withheld.
+/// it again. Its error says to check first, and the steps here, which end
+/// in deploying again, are withheld. So are they when the error or the log
+/// says it of any other call.
 pub(super) fn after(
     outcome: &DeployOutcome,
     principal: Principal,
@@ -182,7 +187,8 @@ pub(super) fn after(
 ) -> Option<Funding> {
     let balance = outcome.short_of_cycles?;
     let to_create = still_to_create(outcome);
-    let unanswered = outcome.error.iter().chain(&outcome.log).any(|line| went_unanswered(line));
+    let unanswered = outcome.unanswered_creation
+        || outcome.error.iter().chain(&outcome.log).any(|line| went_unanswered(line));
     if outcome.status != Status::Failed || to_create == 0 || unanswered {
         return None;
     }
@@ -213,10 +219,11 @@ pub struct Funding {
     /// what the ledger takes for creating it.
     pub needed: String,
     /// The account's balance, in cycles, as the cycles ledger reported it
-    /// when it refused the creation.
+    /// when it refused the creation. Canisters are created at once, so a
+    /// creation still under way then may have changed it since.
     pub balance: String,
-    /// How many cycles of `needed` that balance does not cover: the least
-    /// that has to be added.
+    /// How many cycles of `needed` that balance does not cover: about what
+    /// has to be added. An estimate, as `balance` is of that moment.
     pub shortfall: String,
     /// The funding providers: where the user can get cycles.
     pub providers: Vec<FundingProviderOutput>,
@@ -260,10 +267,10 @@ impl Funding {
     pub fn human(&self) -> String {
         let mut text = format!(
             "The cycles balance did not cover this deploy. Creating the canisters still \
-             missing takes {}; the balance was {} when the cycles ledger refused, so at \
-             least {} more are needed.\nThe balance is that of the Cycles Ledger account of \
-             {}, the principal icp_deploy creates canisters as: added cycles must be \
-             delivered there.",
+             missing takes {}; the balance was {} when the cycles ledger refused, so about \
+             {} more are needed (the balance may have changed since).\nThe balance is that \
+             of the Cycles Ledger account of {}, the principal icp_deploy creates canisters \
+             as: added cycles must be delivered there.",
             amount(&self.needed),
             amount(&self.balance),
             amount(&self.shortfall),
@@ -331,6 +338,7 @@ mod tests {
             error: Some(error.into()),
             log: Vec::new(),
             short_of_cycles,
+            unanswered_creation: false,
         }
     }
 
@@ -433,6 +441,22 @@ mod tests {
         assert!(after(&in_log, who, CYCLES).is_some(), "the refusal alone is answered");
     }
 
+    // Canisters are created at once, and the deploy's error is its first
+    // failure alone. With the ledger's refusal first and another creation
+    // timing out, the error is the refusal and the log has, for the other,
+    // one line that does not say it went unanswered. The calls themselves
+    // say so, and that is enough to withhold the steps.
+    #[test]
+    fn a_second_creation_that_went_unanswered_withholds_the_steps_too() {
+        let who = Principal::management_canister();
+        let mut second = outcome(Status::Failed, &refusal_as_worded(), Some(7));
+        second.log.push("  create frontend: failed: failed to create canister".into());
+        second.log.push("  create worker: failed: a canister call failed".into());
+        assert!(after(&second, who, CYCLES).is_some(), "nothing in the text says it");
+        second.unanswered_creation = true;
+        assert!(after(&second, who, CYCLES).is_none());
+    }
+
     // Only a deploy that failed with a canister still to create: one that
     // was interrupted says so and nothing of funding, and one that has
     // every canister it targeted has nothing more cycles would help.
@@ -483,7 +507,8 @@ mod tests {
         let text = Funding::new(who, 2, CYCLES, 350_000_000_000).human();
         assert!(text.contains("takes 4.0002T (4000200000000 cycles)"), "{text}");
         assert!(text.contains("the balance was 0.35T (350000000000 cycles)"), "{text}");
-        assert!(text.contains("at least 3.6502T (3650200000000 cycles) more"), "{text}");
+        assert!(text.contains("about 3.6502T (3650200000000 cycles) more"), "{text}");
+        assert!(text.contains("may have changed since"), "{text}");
         assert!(text.contains("account of aaaaa-aa"), "{text}");
         for provider in FUNDING_PROVIDERS {
             assert!(text.contains(&format!("- {} ({})", provider.name, provider.app_url)));
@@ -506,9 +531,10 @@ mod tests {
             assert!(steps.contains(tool), "{tool}");
         }
         assert!(steps.contains("`principal`") && steps.contains("checkout URL"));
-        // How much to add is the user's, and a provider's minimum may make
-        // it more than the shortfall.
-        assert!(steps.contains("at least the shortfall") && steps.contains("minimum"));
+        // How much to add is the user's: the shortfall guides it without
+        // being exact, and a provider's minimum may make it more.
+        assert!(steps.contains("The shortfall is the guide, not an exact minimum"), "{steps}");
+        assert!(steps.contains("a provider may have a minimum"), "{steps}");
         for provider in FUNDING_PROVIDERS {
             assert!(!steps.contains(provider.name), "{}", provider.name);
         }

@@ -215,16 +215,19 @@ balance: the cycles ledger refused to create a canister. The canisters it
 had created are in the answer; the rest were not created. Go by that field,
 not by the error's wording: a failure that mentions cycles and has no
 `funding` (a canister that ran out while its code was installed, say) is not
-one that adding cycles to this account fixes. Disregard the icp CLI commands
-the error itself suggests. `funding` holds:
+one that adding cycles to this account fixes. Nor is there any `funding`
+when the error says a call went unanswered, even if cycles were short as
+well: pitfall 9 comes first then, and deploying again does not. Disregard
+the icp CLI commands the error itself suggests. `funding` holds:
 
 - `principal`: the principal `icp_deploy` creates canisters as. Its Cycles
   Ledger account holds the balance, and is the account added cycles must be
   delivered to. It is not the user's principal in any app, the provider's
   included.
 - `needed`, `balance` and `shortfall`, in cycles: what the canisters still
-  to create take, what the ledger said was there when it refused, and what
-  is missing at the least.
+  to create take, what the ledger said was there when it refused, and about
+  what is missing. The balance is of that moment and may have changed since,
+  so the shortfall is a guide, not an exact minimum.
 - `providers`: the funding providers, each with a name, an `app_url` and how
   the user completes the checkout there.
 - `steps`: what to do next, the same for every provider.
@@ -233,8 +236,8 @@ What to do:
 
 1. Do step 3 first, with the `canister_ids` of this answer.
 2. Tell the user what is missing, show them the funding providers, and let
-   them pick one and how many cycles to add: at least the shortfall, and a
-   provider may have a minimum. Do not pick for them, and do not round the
+   them pick one and how many cycles to add: the shortfall is the guide, and
+   a provider may have a minimum. Do not pick for them, and do not round the
    amount up without saying so.
 3. Call `open_app` with the provider's `app_url`, then
    `get_canister_api_doc` on the canister it marks `[declared]`. That guide
