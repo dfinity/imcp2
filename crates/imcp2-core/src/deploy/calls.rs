@@ -1,5 +1,5 @@
 //! The project library's one seam to the network, over this connection's
-//! `ic-agent`: [`CanisterCalls`] signed as the user's management identity.
+//! `ic-agent`: [`CanisterCalls`] signed as the identity the deploy tools act as.
 //!
 //! Modelled on the icp CLI's own implementation (`icp_app::calls::AgentCalls`),
 //! minus proxy-canister routing: this server never names a proxy, so every call

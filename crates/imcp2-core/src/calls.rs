@@ -170,6 +170,10 @@ pub struct OqlGuideOutput {
     pub content: String,
 }
 
+/// Arguments of the tools that take none (`candid_syntax_guide`, `icp_oql_guide`).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NoArgs {}
+
 /// Output of `candid_syntax_guide`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CandidGuideOutput {

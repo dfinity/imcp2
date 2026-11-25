@@ -4703,7 +4703,6 @@ mod tests {
                 ii_url: "https://ii.test".into(),
                 ii_canister: Principal::anonymous(),
             },
-            "https://mcp.test".into(),
             agent,
         );
         super::AuthStore::new(
@@ -5403,7 +5402,6 @@ mod tests {
                         ii_url: "https://ii.test".into(),
                         ii_canister: Principal::anonymous(),
                     },
-                    "https://mcp.test".into(),
                     agent,
                 ),
                 super::SharedClients(super::ClientStore::with(

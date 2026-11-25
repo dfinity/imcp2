@@ -469,11 +469,6 @@ pub struct AccountsOutput {
 pub struct Identities {
     /// The II instance every session in this store is registered against.
     instance: IiInstance,
-    /// This MCP server's own public origin — the `target_origin` the
-    /// management identity is derived at (`target_origin()` reduces it to a
-    /// bare origin either way). Injected by the embedding application, never
-    /// read from the environment here.
-    public_url: String,
     /// The injected base agent (see `McpConfig::agent`). Every identity-bearing
     /// agent is a clone of it with the identity swapped, so delegated and II
     /// calls inherit the host's boundary-node routing and transport.
@@ -482,8 +477,8 @@ pub struct Identities {
 }
 
 impl Identities {
-    pub fn new(instance: IiInstance, public_url: String, agent: Agent) -> Self {
-        Self { instance, public_url, agent, sessions: Arc::default() }
+    pub fn new(instance: IiInstance, agent: Agent) -> Self {
+        Self { instance, agent, sessions: Arc::default() }
     }
 
     /// The injected base agent with `identity` swapped in: a clone shares the
@@ -837,16 +832,6 @@ impl Identities {
     async fn session_agent(&self, session_id: &str) -> Result<Agent, String> {
         let signer = self.session_signer(session_id).await?;
         Ok(self.agent_as(signer))
-    }
-
-    /// A stable per-user identity for the canister-management tools — the user's
-    /// default account at *this* MCP server's own origin, derived on demand like
-    /// any other app. Its principal (`self_authenticating(user_key)`) is stable
-    /// across reconnects (unlike the ephemeral session key), so it works as the
-    /// user's controller/funder identity.
-    pub async fn management_identity(&self, session_id: &str) -> Result<DelegatedIdentity, String> {
-        let origin = self.public_url.clone();
-        self.delegated_identity(session_id, &origin, None).await
     }
 
     /// List the user's Internet Identity accounts at an app `domain`, via II's
@@ -1916,7 +1901,6 @@ mod tests {
                 ii_url: "https://ii.test".into(),
                 ii_canister: Principal::anonymous(),
             },
-            "https://mcp.test".into(),
             agent,
         )
     }

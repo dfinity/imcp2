@@ -536,7 +536,6 @@ impl Harness {
                 ii_url: "https://internet-identity.invalid".into(),
                 ii_canister: Principal::anonymous(),
             },
-            "https://mcp.invalid".into(),
             agent.clone(),
         );
         let principal = identities

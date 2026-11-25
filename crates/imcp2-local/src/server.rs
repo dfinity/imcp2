@@ -343,11 +343,7 @@ mod tests {
     fn test_server() -> LocalServer {
         let agent =
             imcp2_core::Agent::builder().with_url(imcp2_core::IC_URL).build().expect("agent");
-        let identities = Identities::new(
-            IiInstance::prod().expect("prod II"),
-            "https://mcp.internetcomputer.org".into(),
-            agent.clone(),
-        );
+        let identities = Identities::new(IiInstance::prod().expect("prod II"), agent.clone());
         let slot = SessionSlot::new();
         let tools = IcTools::new(agent, identities.clone(), slot.resolver());
         let deploy = IcDeployTools::new(identities.clone(), slot.resolver());
@@ -573,17 +569,15 @@ mod tests {
         .await;
         assert!(text.contains("authenticated session"), "released: {text}");
 
-        // Deferral: a protocol/meta tool is not just unlisted — calling it
+        // A tool this server does not serve (here, one it used to define)
         // fails with the router's standard "tool not found" error (the
         // invalid-params shape any unknown tool name gets), rather than
-        // running — and rather than dying some other way: a disconnect or a
-        // different error must not pass this regression.
+        // dying some other way: a disconnect or a different error must not
+        // pass this regression.
         let mut params = rmcp::model::CallToolRequestParams::new("icp_get_skill");
         params.arguments = serde_json::json!({ "name": "writing-motoko" }).as_object().cloned();
-        let err = client
-            .call_tool(params)
-            .await
-            .expect_err("deferred protocol tools must not be callable");
+        let err =
+            client.call_tool(params).await.expect_err("an unserved tool must not be callable");
         match err {
             rmcp::ServiceError::McpError(e) => {
                 assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{e:?}");

@@ -2374,28 +2374,15 @@ async fn enrich_with_dashboard(client: &reqwest::Client, found: &mut [Found]) {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard-backed lookup & search.
+// Dashboard-backed lookup.
 //
-// https://dashboard.internetcomputer.org is backed by public REST APIs that map
-// a canister id to a curated identity, and that let us search the IC's named
-// "services" (ICRC tokens + SNS projects) by name. There is NO public endpoint
-// to search the full ~1.2M canister set by name, so name search runs over these
-// two bounded registries — which is where the meaningful services live.
+// https://dashboard.internetcomputer.org is backed by a public REST API that
+// maps a canister id to a curated identity.
 // ---------------------------------------------------------------------------
 
 /// IC dashboard API (canister identity). Override with `IC_DASHBOARD_API`.
 fn dashboard_api() -> String {
     api_base("IC_DASHBOARD_API", "https://ic-api.internetcomputer.org")
-}
-
-/// ICRC token registry API. Override with `IC_ICRC_API`.
-fn icrc_api() -> String {
-    api_base("IC_ICRC_API", "https://icrc-api.internetcomputer.org")
-}
-
-/// SNS catalog API. Override with `IC_SNS_API`.
-fn sns_api() -> String {
-    api_base("IC_SNS_API", "https://sns-api.internetcomputer.org")
 }
 
 fn api_base(var: &str, default: &str) -> String {
@@ -2414,20 +2401,6 @@ fn resolve_base(configured: Option<String>, default: &str) -> String {
     }
 }
 
-/// Shared HTTP client for dashboard/registry calls (fixed public hosts) and the
-/// `icp_lookup_canister_info_by_id` tool. Carries the SSRF redirect guard so a 3xx can never
-/// bounce a request onto an internal host. Short-ish timeout since these back
-/// interactive tools. (User-supplied *site* fetches use [`site_client`], which
-/// additionally pins the resolved address.)
-pub fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent("ic-mcp-discover/0.1")
-        .timeout(std::time::Duration::from_secs(15))
-        .redirect(ssrf_redirect_policy())
-        .build()
-        .map_err(|e| format!("http client: {e}"))
-}
-
 /// What a canister IS, per the IC dashboard's curated metadata.
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct CanisterInfo {
@@ -2442,50 +2415,6 @@ pub struct CanisterInfo {
     pub language: Option<String>,
     /// Proposal id of the most recent recorded upgrade, if any.
     pub latest_upgrade_proposal: Option<u64>,
-}
-
-/// Arguments for `icp_lookup_canister_info_by_id`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct LookupCanisterArgs {
-    /// Canister principal to identify, e.g. "ryjl3-tyaaa-aaaaa-aaaba-cai".
-    pub canister_id: String,
-}
-
-/// The `icp_lookup_canister_info_by_id` MCP output shape — the IC dashboard's identity for a
-/// canister id.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct CanisterIdentityOutput {
-    /// The canister that was identified.
-    pub canister_id: String,
-    /// Curated label, e.g. "ICP Ledger"; null for unlabelled canisters.
-    pub name: Option<String>,
-    /// Classification, e.g. "ledger"; null when unclassified.
-    pub canister_type: Option<String>,
-    /// Controller principals.
-    pub controllers: Vec<String>,
-    /// Hosting subnet id, if known.
-    pub subnet_id: Option<String>,
-    /// Module hash (hex), if known.
-    pub module_hash: Option<String>,
-    /// Implementation language, if known.
-    pub language: Option<String>,
-    /// Proposal id of the most recent recorded upgrade, if any.
-    pub latest_upgrade_proposal: Option<u64>,
-}
-
-impl From<CanisterInfo> for CanisterIdentityOutput {
-    fn from(info: CanisterInfo) -> Self {
-        Self {
-            canister_id: info.canister_id,
-            name: info.name,
-            canister_type: info.canister_type,
-            controllers: info.controllers,
-            subnet_id: info.subnet_id,
-            module_hash: info.module_hash,
-            language: info.language,
-            latest_upgrade_proposal: info.latest_upgrade_proposal,
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -2561,66 +2490,6 @@ pub async fn lookup_canister(client: &reqwest::Client, id: &str) -> Result<Canis
     let raw: RawCanister = serde_json::from_str(&body)
         .map_err(|e| format!("could not parse dashboard response: {e}"))?;
     Ok(raw.into())
-}
-
-/// A named canister found by searching the IC's service registries.
-#[derive(Serialize, Clone, Debug)]
-pub struct Match {
-    pub canister_id: String,
-    pub name: String,
-    /// "token" (ICRC ledger) or "sns" (SNS project root).
-    pub kind: String,
-    pub note: Option<String>,
-}
-
-/// One canister matched by `icp_find_canister_by_name` — the MCP output shape (a
-/// serialization mirror of [`Match`]).
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct FoundCanister {
-    /// The canister's principal id, e.g. "xevnm-gaaaa-aaaar-qafnq-cai".
-    pub canister_id: String,
-    /// Human-readable name or token symbol, e.g. "ckUSDC".
-    pub name: String,
-    /// What the id is: "token" (an ICRC ledger) or "sns" (an SNS project root).
-    pub kind: String,
-    /// An optional extra note about the match, when the registry provides one.
-    pub note: Option<String>,
-}
-
-impl From<&Match> for FoundCanister {
-    fn from(m: &Match) -> Self {
-        Self {
-            canister_id: m.canister_id.clone(),
-            name: m.name.clone(),
-            kind: m.kind.clone(),
-            note: m.note.clone(),
-        }
-    }
-}
-
-/// Arguments for `icp_find_canister_by_name`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct FindCanisterArgs {
-    /// A name, token symbol, or project to search for, e.g. "ckUSDC", "ICP",
-    /// "OpenChat".
-    pub query: String,
-}
-
-/// Structured output of `icp_find_canister_by_name`.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct FindCanisterOutput {
-    /// The name, token symbol, or project that was searched for.
-    pub query: String,
-    /// Canisters from the IC's labelled service registries that matched
-    /// `query` — empty when nothing matched.
-    pub matches: Vec<FoundCanister>,
-}
-
-impl From<(String, Vec<Match>)> for FindCanisterOutput {
-    /// `(query, matches)` → the structured `icp_find_canister_by_name` reply.
-    fn from((query, matches): (String, Vec<Match>)) -> Self {
-        Self { query, matches: matches.iter().map(FoundCanister::from).collect() }
-    }
 }
 
 /// One well-known app matched by `icp_find_app_by_name`.
@@ -2734,130 +2603,6 @@ pub fn find_app_by_name(query: &str) -> FindAppOutput {
             }
         }
     }
-}
-
-#[derive(Deserialize)]
-struct LedgersResp {
-    #[serde(default)]
-    data: Vec<RawLedger>,
-}
-
-#[derive(Deserialize)]
-struct RawLedger {
-    ledger_canister_id: String,
-    #[serde(default)]
-    sns_root_canister_id: Option<String>,
-    #[serde(default)]
-    icrc1_metadata: LedgerMeta,
-}
-
-#[derive(Deserialize, Default)]
-struct LedgerMeta {
-    #[serde(default)]
-    icrc1_name: Option<String>,
-    #[serde(default)]
-    icrc1_symbol: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SnsesResp {
-    #[serde(default)]
-    data: Vec<RawSns>,
-}
-
-#[derive(Deserialize)]
-struct RawSns {
-    root_canister_id: String,
-    #[serde(default)]
-    name: Option<String>,
-}
-
-/// Search the IC's named services by name/symbol. Fetches the (bounded) ICRC
-/// ledger registry and SNS catalog, then filters locally — there is no public
-/// name-search over all canisters.
-pub async fn search_by_name(query: &str) -> Result<Vec<Match>, String> {
-    // Nothing to search for — skip the network round-trips entirely.
-    if query.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let client = http_client()?;
-    // Both registries are small (≈60 entries each); limit=100 captures them all
-    // in one request. The API rejects very large limits (HTTP 422). Fetch the two
-    // independent registries concurrently to keep this interactive tool snappy.
-    let ledgers_url = format!("{}/api/v1/ledgers?limit=100", icrc_api());
-    let snses_url = format!("{}/api/v1/snses?limit=100&offset=0", sns_api());
-    let (ledgers, snses) =
-        tokio::join!(fetch_text(&client, &ledgers_url), fetch_text(&client, &snses_url),);
-
-    // Best-effort: tolerate one registry being down, but not both.
-    if ledgers.is_err() && snses.is_err() {
-        return Err(ledgers.err().or(snses.err()).unwrap_or_else(|| "search failed".into()));
-    }
-    Ok(search_in(ledgers.as_deref().unwrap_or("{}"), snses.as_deref().unwrap_or("{}"), query))
-}
-
-async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String, String> {
-    let resp = client.get(url).send().await.map_err(|e| format!("request to {url} failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("{url} returned HTTP {}", resp.status().as_u16()));
-    }
-    resp.text().await.map_err(|e| format!("reading {url}: {e}"))
-}
-
-/// Pure filter over the two registries (split out so it's unit-testable).
-fn search_in(ledgers_json: &str, snses_json: &str, query: &str) -> Vec<Match> {
-    let q = query.trim().to_lowercase();
-    let mut out = Vec::new();
-    if q.is_empty() {
-        return out;
-    }
-
-    if let Ok(resp) = serde_json::from_str::<LedgersResp>(ledgers_json) {
-        for l in resp.data {
-            let symbol = l.icrc1_metadata.icrc1_symbol.unwrap_or_default();
-            let name = l.icrc1_metadata.icrc1_name.unwrap_or_default();
-            if symbol.to_lowercase().contains(&q) || name.to_lowercase().contains(&q) {
-                let display = if symbol.is_empty() {
-                    name.clone()
-                } else if name.is_empty() || name == symbol {
-                    symbol.clone()
-                } else {
-                    format!("{name} ({symbol})")
-                };
-                let note = match l.sns_root_canister_id {
-                    Some(r) => format!("ICRC token ledger; SNS root {r}"),
-                    None => "ICRC token ledger".into(),
-                };
-                out.push(Match {
-                    canister_id: l.ledger_canister_id,
-                    name: display,
-                    kind: "token".into(),
-                    note: Some(note),
-                });
-            }
-        }
-    }
-
-    if let Ok(resp) = serde_json::from_str::<SnsesResp>(snses_json) {
-        for s in resp.data {
-            let name = s.name.unwrap_or_default();
-            if name.to_lowercase().contains(&q) {
-                out.push(Match {
-                    canister_id: s.root_canister_id,
-                    name,
-                    kind: "sns".into(),
-                    note: Some(
-                        "SNS project root — icp_lookup_canister_info_by_id (or the SNS detail API) expands it \
-                         to governance/ledger/swap/index"
-                            .into(),
-                    ),
-                });
-            }
-        }
-    }
-
-    out.truncate(25);
-    out
 }
 
 #[cfg(test)]
@@ -3110,22 +2855,6 @@ mod tests {
         );
     }
 
-    // Live network: "ckUSDC" resolves to the ckUSDC ledger via the dashboard's
-    // token registry, and that id identifies as a "ledger".
-    #[tokio::test]
-    async fn search_finds_ckusdc_and_lookup_identifies_it() {
-        let matches = search_by_name("ckUSDC").await.expect("search");
-        assert!(
-            matches.iter().any(|m| m.canister_id == "xevnm-gaaaa-aaaar-qafnq-cai"),
-            "ckUSDC ledger not found: {matches:?}"
-        );
-
-        let client = http_client().expect("client");
-        let info = lookup_canister(&client, "xevnm-gaaaa-aaaar-qafnq-cai").await.expect("lookup");
-        assert_eq!(info.canister_type.as_deref(), Some("ledger"));
-        assert!(info.name.as_deref().unwrap_or_default().contains("ckUSDC"));
-    }
-
     // A set-but-blank IC_*_API env var must not yield a scheme-less base URL.
     #[test]
     fn resolve_base_falls_back_on_blank_or_unset() {
@@ -3134,46 +2863,6 @@ mod tests {
         assert_eq!(resolve_base(Some("".into()), default), default);
         assert_eq!(resolve_base(Some("   ".into()), default), default);
         assert_eq!(resolve_base(Some("https://x.example/".into()), default), "https://x.example");
-    }
-
-    // A blank query short-circuits before any network call.
-    #[tokio::test]
-    async fn search_by_name_blank_is_empty_without_network() {
-        assert!(search_by_name("   ").await.unwrap().is_empty());
-    }
-
-    // Name search filters the bounded token + SNS registries (offline fixtures).
-    #[test]
-    fn search_in_matches_token_symbol_and_sns_name() {
-        let ledgers = r#"{"data":[
-            {"ledger_canister_id":"xevnm-gaaaa-aaaar-qafnq-cai","sns_root_canister_id":null,
-             "icrc1_metadata":{"icrc1_name":"ckUSDC","icrc1_symbol":"ckUSDC"}},
-            {"ledger_canister_id":"ryjl3-tyaaa-aaaaa-aaaba-cai","sns_root_canister_id":null,
-             "icrc1_metadata":{"icrc1_name":"Internet Computer","icrc1_symbol":"ICP"}}
-        ],"total_ledgers":2}"#;
-        let snses = r#"{"data":[
-            {"root_canister_id":"3e3x2-xyaaa-aaaaq-aaala-cai","name":"OpenChat"}
-        ],"total_snses":1}"#;
-
-        // The headline flow: "ckUSDC" -> the ledger canister id.
-        let usdc = search_in(ledgers, snses, "ckusdc");
-        assert_eq!(usdc.len(), 1, "{usdc:?}");
-        assert_eq!(usdc[0].canister_id, "xevnm-gaaaa-aaaar-qafnq-cai");
-        assert_eq!(usdc[0].kind, "token");
-
-        // SNS projects match by name and resolve to the root canister.
-        let oc = search_in(ledgers, snses, "openchat");
-        assert_eq!(oc.len(), 1, "{oc:?}");
-        assert_eq!(oc[0].canister_id, "3e3x2-xyaaa-aaaaq-aaala-cai");
-        assert_eq!(oc[0].kind, "sns");
-
-        // Symbol substring still matches the ICP ledger.
-        assert!(search_in(ledgers, snses, "icp")
-            .iter()
-            .any(|m| m.canister_id == "ryjl3-tyaaa-aaaaa-aaaba-cai"));
-
-        // Blank query matches nothing.
-        assert!(search_in(ledgers, snses, "   ").is_empty());
     }
 
     // Dashboard JSON normalisation: blanks -> None, newest upgrade by timestamp.

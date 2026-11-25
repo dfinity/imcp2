@@ -2,8 +2,8 @@
 //!
 //! The server exposes MCP tools over streamable HTTP that talk to the Internet
 //! Computer via `ic-agent` (discover the canisters behind an app, read/write
-//! canisters as the user's Internet Identity account, OQL reads, canister
-//! management, …), gated by an OAuth 2.1 authorization server whose login
+//! canisters as the user's Internet Identity account, OQL reads, …), gated
+//! by an OAuth 2.1 authorization server whose login
 //! mechanism is Internet Identity's `/mcp` connect handshake.
 //!
 //! One [`McpServer`] serves one Internet Identity instance ([`IiInstance`]) and
@@ -214,8 +214,7 @@ impl McpServer {
         let deploy = deploy::Deploys::new(&config.deploy, &state_dir)?;
         let public_url = normalize_public_url(&config.public_url);
         let mcp_path = normalize_mount_path(&config.mcp_path);
-        let identities =
-            identities::Identities::new(config.instance, public_url.clone(), config.agent.clone());
+        let identities = identities::Identities::new(config.instance, config.agent.clone());
         let store = auth::AuthStore::new(
             identities.clone(),
             SharedClients::load(&state_dir, deploy.owner()),
@@ -250,8 +249,7 @@ impl McpServer {
     /// for retiring one endpoint.
     pub fn sibling(&self, instance: IiInstance, mcp_path: &str) -> Self {
         let mcp_path = normalize_mount_path(mcp_path);
-        let identities =
-            identities::Identities::new(instance, self.public_url.clone(), self.agent.clone());
+        let identities = identities::Identities::new(instance, self.agent.clone());
         Self {
             agent: self.agent.clone(),
             store: self.store.for_instance(identities.clone(), mcp_path.clone()),
